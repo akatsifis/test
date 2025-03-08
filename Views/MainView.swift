@@ -3,6 +3,8 @@ import SwiftUI
 struct MainView: View {
     @EnvironmentObject var authManager: AuthenticationManager
     @EnvironmentObject var networkMonitor: NetworkMonitor
+    @EnvironmentObject var notificationManager: AldoNotificationManager
+    @State private var showingNotifications = false
     
     // Set a fixed size for buttons
     let buttonWidth: CGFloat = 300
@@ -101,9 +103,26 @@ struct MainView: View {
                     }
 
                     Spacer() // To ensure buttons are positioned towards the top
-
                 }
                 .padding(.horizontal, 20)
+            }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(action: {
+                        showingNotifications = true
+                    }) {
+                        ZStack {
+                            Image(systemName: "bell.fill")
+                                .foregroundColor(.white)
+                                .font(.system(size: 22))
+                            
+                            AldoNotificationBadge(count: notificationManager.unreadCount)
+                        }
+                    }
+                }
+            }
+            .sheet(isPresented: $showingNotifications) {
+                AldoNotificationView()
             }
         }
     }

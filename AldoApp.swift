@@ -1,10 +1,3 @@
-//
-//  AldoApp.swift
-//  Aldo
-//
-//  Created by Andrew Katsifis on 6/12/24.
-//
-
 import SwiftUI
 import Firebase
 
@@ -13,6 +6,7 @@ struct AldoApp: App {
     @StateObject private var workoutManager = iOSWorkoutManager()
     @StateObject private var authManager = AuthenticationManager()
     @StateObject private var networkMonitor = NetworkMonitor()
+    @StateObject private var notificationManager = AldoNotificationManager.shared
 
     init() {
         // Initialize Firebase first, before any other Firebase service is used
@@ -28,6 +22,7 @@ struct AldoApp: App {
                 .environmentObject(workoutManager)
                 .environmentObject(authManager)
                 .environmentObject(networkMonitor)
+                .environmentObject(notificationManager)
         }
     }
 }
