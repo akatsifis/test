@@ -33,9 +33,18 @@ class LeagueService {
     }
     
     // MARK: - Create a New League (Updated to accept individual parameters)
-    func createLeague(name: String, hostUserId: String, members: [String], course: String, schedule: String, completion: @escaping (Bool) -> Void) {
+    func createLeague(name: String, hostUserId: String, members: [String], course: String, schedule: String, playDay: WeekDay, completion: @escaping (Bool) -> Void) {
         // Create the league object
-        let league = League(name: name, hostUserId: hostUserId, members: members, course: course, schedule: schedule, createdAt: Timestamp(date: Date()))
+        let league = EnhancedLeague(
+            id: "", // This will be set by Firestore
+            name: name,
+            hostUserId: hostUserId,
+            members: members,
+            course: course,
+            schedule: schedule,
+            playDay: playDay,
+            createdAt: Timestamp(date: Date())
+        )
 
         // Check if league name is unique
         isLeagueNameUnique(name: league.name) { isUnique in
@@ -58,11 +67,11 @@ class LeagueService {
     }
     
     // MARK: - Add Round to League
-    func addRoundToLeague(leagueId: String, round: League.Round, completion: @escaping (Bool) -> Void) {
+    func addRoundToLeague(leagueId: String, round: LeagueRound, completion: @escaping (Bool) -> Void) {
         let roundData: [String: Any] = [
             "number": round.number,
             "score": round.score,
-            "createdAt": Timestamp(date: Date())
+            "createdAt": round.createdAt
         ]
         
         db.collection("leagues").document(leagueId).collection("rounds").addDocument(data: roundData) { error in
@@ -77,14 +86,14 @@ class LeagueService {
     }
     
     // MARK: - Update Scores for a Round
-    func updateScores(leagueId: String, roundId: String, score: League.Score, completion: @escaping (Bool) -> Void) {
+    func updateScores(leagueId: String, roundId: String, score: Score, completion: @escaping (Bool) -> Void) {
         let scoreData: [String: Any] = [
             "userId": score.userId,
             "holeScores": score.holeScores,
             "updatedAt": Timestamp(date: Date())
         ]
         
-        let scoresRef = db.collection("leagues").document(leagueId).collection("rounds").document(roundId).collection("scores").document(score.id.uuidString)
+        let scoresRef = db.collection("leagues").document(leagueId).collection("rounds").document(roundId).collection("scores").document(score.id)
         scoresRef.setData(scoreData) { error in
             if let error = error {
                 print("Error updating score: \(error.localizedDescription)")
@@ -97,7 +106,7 @@ class LeagueService {
     }
 
     // MARK: - Fetch League Data
-    func fetchLeagueData(leagueId: String, completion: @escaping (League?) -> Void) {
+    func fetchLeagueData(leagueId: String, completion: @escaping (EnhancedLeague?) -> Void) {
         db.collection("leagues").document(leagueId).getDocument { document, error in
             if let error = error {
                 print("Error fetching league data: \(error.localizedDescription)")
@@ -111,18 +120,12 @@ class LeagueService {
                 return
             }
             
-            // Map Firestore data to League model
-            let data = document.data()
-            let league = League(
-                id: document.documentID,
-                name: data?["name"] as? String ?? "",
-                hostUserId: data?["hostUserId"] as? String ?? "",
-                members: data?["members"] as? [String] ?? [],
-                course: data?["course"] as? String ?? "",
-                schedule: data?["schedule"] as? String ?? "",
-                createdAt: data?["createdAt"] as? Timestamp ?? Timestamp(date: Date()) // Ensure valid Timestamp
-            )
-            completion(league)
+            // Map Firestore data to EnhancedLeague model
+            if let league = EnhancedLeague.fromDictionary(document.data() ?? [:], id: document.documentID) {
+                completion(league)
+            } else {
+                completion(nil)
+            }
         }
     }
 }

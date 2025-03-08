@@ -15,7 +15,11 @@ struct AldoApp: App {
     @StateObject private var networkMonitor = NetworkMonitor()
 
     init() {
-        FirebaseApp.configure() // Initialize Firebase
+        // Initialize Firebase first, before any other Firebase service is used
+        FirebaseApp.configure()
+        
+        // Configure Firestore settings after Firebase is initialized
+        FirestoreManager.configureFirestore()
     }
 
     var body: some Scene {

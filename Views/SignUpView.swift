@@ -196,10 +196,6 @@ struct SignUpView: View {
                 
                 switch result {
                 case .success(let userModel):
-                    // Update the auth manager with the new user
-                    authManager.currentUser = userModel
-                    authManager.isAuthenticated = true
-                    
                     // Show success and dismiss
                     showSuccessAlert = true
                     

@@ -5,21 +5,14 @@
 //  Created by Andrew Katsifis on 3/5/25.
 //
 
-
-//
-//  ProfileView.swift
-//  Aldo
-//
-//  Created by Andrew Katsifis on 3/4/25.
-//
-
-
 import SwiftUI
 import Firebase
+import FirebaseFirestore
 
 struct ProfileView: View {
     @EnvironmentObject var authManager: AuthenticationManager
     @State private var showingEditView = false
+    @State private var userModel: Models.User?
     
     var body: some View {
         ScrollView {
@@ -27,19 +20,27 @@ struct ProfileView: View {
                 // Profile Header
                 VStack {
                     // Profile picture
-                    if let user = authManager.currentUser, let profilePicture = user.profilePicture, 
+                    if let user = userModel, let profilePicture = user.profilePicture,
                        let url = URL(string: profilePicture) {
-                        CachedAsyncImage(url: url) { image in
-                            image
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: 120, height: 120)
-                                .clipShape(Circle())
-                                .overlay(Circle().stroke(Color.blue, lineWidth: 3))
-                                .shadow(radius: 5)
-                        } placeholder: {
-                            ProgressView()
-                                .frame(width: 120, height: 120)
+                        AsyncImage(url: url) { phase in
+                            if let image = phase.image {
+                                image
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: 120, height: 120)
+                                    .clipShape(Circle())
+                                    .overlay(Circle().stroke(Color.blue, lineWidth: 3))
+                                    .shadow(radius: 5)
+                            } else if phase.error != nil {
+                                Image(systemName: "person.circle.fill")
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 120, height: 120)
+                                    .foregroundColor(.gray)
+                            } else {
+                                ProgressView()
+                                    .frame(width: 120, height: 120)
+                            }
                         }
                     } else {
                         Image(systemName: "person.circle.fill")
@@ -50,7 +51,7 @@ struct ProfileView: View {
                     }
                     
                     // Username and basic info
-                    if let user = authManager.currentUser {
+                    if let user = userModel {
                         Text(user.username)
                             .font(.title)
                             .fontWeight(.bold)
@@ -96,7 +97,7 @@ struct ProfileView: View {
                         .fontWeight(.bold)
                         .padding(.horizontal)
                     
-                    if let user = authManager.currentUser {
+                    if let user = userModel {
                         // Total Rounds
                         StatCardView(
                             icon: "flag.fill",
@@ -131,7 +132,7 @@ struct ProfileView: View {
                         .fontWeight(.bold)
                         .padding(.horizontal)
                     
-                    if let user = authManager.currentUser, !user.scores.isEmpty {
+                    if let user = userModel, !user.scores.isEmpty {
                         ForEach(user.scores.sorted(by: { $0.date > $1.date }).prefix(3), id: \.id) { score in
                             RoundCardView(score: score)
                         }
@@ -159,7 +160,12 @@ struct ProfileView: View {
                 
                 // Log out button
                 Button(action: {
-                    authManager.logout()
+                    do {
+                        try Auth.auth().signOut()
+                        // Handle any UI updates needed
+                    } catch {
+                        print("Error signing out: \(error.localizedDescription)")
+                    }
                 }) {
                     Text("Log Out")
                         .font(.headline)
@@ -176,7 +182,26 @@ struct ProfileView: View {
         }
         .navigationTitle("Profile")
         .sheet(isPresented: $showingEditView) {
-            ProfileEditView()
+            if let user = userModel {
+                ProfileEditView(userModel: user)
+            }
+        }
+        .onAppear(perform: fetchUserData)
+    }
+    
+    private func fetchUserData() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        
+        let db = Firestore.firestore()
+        db.collection("users").document(userId).getDocument { snapshot, error in
+            if let error = error {
+                print("Error fetching user data: \(error.localizedDescription)")
+                return
+            }
+            
+            if let snapshot = snapshot, let data = snapshot.data() {
+                self.userModel = Models.User.fromDictionary(data, id: snapshot.documentID)
+            }
         }
     }
     
@@ -284,7 +309,7 @@ struct RoundCardView: View {
 
 struct ProfileEditView: View {
     @Environment(\.presentationMode) var presentationMode
-    @EnvironmentObject var authManager: AuthenticationManager
+    var userModel: Models.User
     
     @State private var username: String = ""
     @State private var firstName: String = ""
@@ -310,18 +335,26 @@ struct ProfileEditView: View {
                                 .frame(width: 120, height: 120)
                                 .clipShape(Circle())
                                 .overlay(Circle().stroke(Color.blue, lineWidth: 3))
-                        } else if let user = authManager.currentUser, let profilePicture = user.profilePicture,
+                        } else if let profilePicture = userModel.profilePicture,
                                   let url = URL(string: profilePicture) {
-                            CachedAsyncImage(url: url) { image in
-                                image
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: 120, height: 120)
-                                    .clipShape(Circle())
-                                    .overlay(Circle().stroke(Color.blue, lineWidth: 3))
-                            } placeholder: {
-                                ProgressView()
-                                    .frame(width: 120, height: 120)
+                            AsyncImage(url: url) { phase in
+                                if let image = phase.image {
+                                    image
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fill)
+                                        .frame(width: 120, height: 120)
+                                        .clipShape(Circle())
+                                        .overlay(Circle().stroke(Color.blue, lineWidth: 3))
+                                } else if phase.error != nil {
+                                    Image(systemName: "person.circle.fill")
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: 120, height: 120)
+                                        .foregroundColor(.gray)
+                                } else {
+                                    ProgressView()
+                                        .frame(width: 120, height: 120)
+                                }
                             }
                         } else {
                             Image(systemName: "person.circle.fill")
@@ -392,22 +425,14 @@ struct ProfileEditView: View {
     }
     
     private func loadUserData() {
-        guard let user = authManager.currentUser else { return }
-        
-        username = user.username
-        firstName = user.firstName
-        lastName = user.lastName
-        bio = user.bio
-        location = user.location
+        username = userModel.username
+        firstName = userModel.firstName
+        lastName = userModel.lastName
+        bio = userModel.bio
+        location = userModel.location
     }
     
     private func saveChanges() {
-        guard let user = authManager.currentUser else {
-            alertMessage = "User data not available"
-            showAlert = true
-            return
-        }
-        
         isLoading = true
         
         // First handle profile image update if needed
@@ -416,7 +441,7 @@ struct ProfileEditView: View {
                 switch result {
                 case .success(let imageURL):
                     // Now update the rest of user info
-                    updateUserInfo(user: user, profilePictureURL: imageURL)
+                    updateUserInfo(profilePictureURL: imageURL)
                     
                 case .failure(let error):
                     isLoading = false
@@ -426,13 +451,13 @@ struct ProfileEditView: View {
             }
         } else {
             // Just update user info
-            updateUserInfo(user: user, profilePictureURL: user.profilePicture)
+            updateUserInfo(profilePictureURL: userModel.profilePicture)
         }
     }
     
-    private func updateUserInfo(user: Models.User, profilePictureURL: String?) {
+    private func updateUserInfo(profilePictureURL: String?) {
         // Create updated user model
-        var updatedUser = user
+        var updatedUser = userModel
         updatedUser.username = username
         updatedUser.firstName = firstName
         updatedUser.lastName = lastName

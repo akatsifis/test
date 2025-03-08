@@ -1,144 +1,191 @@
-//
-//  PhoneVerificationView.swift
-//  Aldo
-//
-//  Created by Andrew Katsifis on 3/5/25.
-//
-
 import SwiftUI
-import Firebase
+import FirebaseAuth
+import FirebaseFirestore
 
 struct PhoneVerificationView: View {
     @EnvironmentObject var authManager: AuthenticationManager
     @Environment(\.presentationMode) var presentationMode
     
-    @State private var phoneNumber: String = ""
-    @State private var verificationCode: String = ""
-    @State private var isVerificationSent = false
-    @State private var errorMessage: String? = nil
-    @State private var isLoading = false
+    @State private var phoneNumber = ""
+    @State private var verificationCode = ""
+    @State private var verificationId: String? = nil
+    @State private var isCodeSent = false
+    @State private var isVerifying = false
+    @State private var showAlert = false
+    @State private var alertTitle = ""
+    @State private var alertMessage = ""
     
     var body: some View {
         VStack(spacing: 20) {
-            Text("Phone Verification")
-                .font(.largeTitle)
-                .fontWeight(.bold)
-                .padding(.bottom, 20)
-            
-            if !isVerificationSent {
-                // Phone number input
-                TextField("Phone Number", text: $phoneNumber)
-                    .keyboardType(.phonePad)
-                    .padding()
-                    .background(Color(.systemGray6))
-                    .cornerRadius(10)
-                    .padding(.horizontal)
+            if !isCodeSent {
+                // Phone Number Entry
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Enter your phone number")
+                        .font(.headline)
+                    
+                    TextField("Phone Number", text: $phoneNumber)
+                        .keyboardType(.phonePad)
+                        .padding()
+                        .background(Color(.systemGray6))
+                        .cornerRadius(8)
+                    
+                    Text("We'll send a verification code to this number")
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                }
                 
                 Button(action: sendVerificationCode) {
-                    if isLoading {
+                    if isVerifying {
                         ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle())
-                    } else {
-                        Text("Send Verification Code")
-                            .fontWeight(.semibold)
-                            .foregroundColor(.white)
                             .padding()
                             .frame(maxWidth: .infinity)
+                            .background(Color.blue.opacity(0.6))
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                    } else {
+                        Text("Send Code")
+                            .padding()
+                            .frame(maxWidth: .infinity)
+                            .background(Color.blue)
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
                     }
                 }
-                .background(isLoading ? Color.gray : Color.blue)
-                .cornerRadius(10)
-                .padding(.horizontal)
-                .disabled(isLoading || phoneNumber.isEmpty)
+                .disabled(phoneNumber.isEmpty || isVerifying)
             } else {
-                // Verification code input
-                TextField("Verification Code", text: $verificationCode)
-                    .keyboardType(.numberPad)
-                    .padding()
-                    .background(Color(.systemGray6))
-                    .cornerRadius(10)
-                    .padding(.horizontal)
+                // Verification Code Entry
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Enter verification code")
+                        .font(.headline)
+                    
+                    TextField("Code", text: $verificationCode)
+                        .keyboardType(.numberPad)
+                        .padding()
+                        .background(Color(.systemGray6))
+                        .cornerRadius(8)
+                    
+                    Text("Enter the 6-digit code sent to \(phoneNumber)")
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                }
                 
                 Button(action: verifyCode) {
-                    if isLoading {
+                    if isVerifying {
                         ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle())
-                    } else {
-                        Text("Verify Code")
-                            .fontWeight(.semibold)
-                            .foregroundColor(.white)
                             .padding()
                             .frame(maxWidth: .infinity)
+                            .background(Color.green.opacity(0.6))
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                    } else {
+                        Text("Verify")
+                            .padding()
+                            .frame(maxWidth: .infinity)
+                            .background(Color.green)
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
                     }
                 }
-                .background(isLoading ? Color.gray : Color.green)
-                .cornerRadius(10)
-                .padding(.horizontal)
-                .disabled(isLoading || verificationCode.isEmpty)
+                .disabled(verificationCode.count < 6 || isVerifying)
                 
                 Button(action: {
-                    isVerificationSent = false
-                    errorMessage = nil
+                    isCodeSent = false
+                    verificationCode = ""
                 }) {
                     Text("Change Phone Number")
                         .foregroundColor(.blue)
-                        .padding(.top)
                 }
             }
-            
-            if let errorMessage = errorMessage {
-                Text(errorMessage)
-                    .foregroundColor(.red)
-                    .padding()
-            }
-            
-            Spacer()
         }
         .padding()
+        .navigationTitle("Phone Verification")
+        .alert(isPresented: $showAlert) {
+            Alert(
+                title: Text(alertTitle),
+                message: Text(alertMessage),
+                dismissButton: .default(Text("OK"))
+            )
+        }
     }
     
     private func sendVerificationCode() {
-        isLoading = true
-        errorMessage = nil
+        guard !phoneNumber.isEmpty else { return }
         
-        // Format phone number to E.164 standard if needed
+        isVerifying = true
+        
+        // Format phone number if needed
         let formattedNumber = formatPhoneNumber(phoneNumber)
         
-        $authManager.sendVerificationCode(to: formattedNumber) { success, error in
-            isLoading = false
+        // Call Auth.auth().verifyPhoneNumber directly
+        PhoneAuthProvider.provider().verifyPhoneNumber(formattedNumber, uiDelegate: nil) { verificationID, error in
+            isVerifying = false
             
-            if success {
-                isVerificationSent = true
-            } else {
-                errorMessage = error ?? "Failed to send verification code. Please try again."
+            if let error = error {
+                alertTitle = "Error"
+                alertMessage = "Failed to send verification code: \(error.localizedDescription)"
+                showAlert = true
+                return
+            }
+            
+            if let verificationID = verificationID {
+                self.verificationId = verificationID
+                isCodeSent = true
             }
         }
     }
     
     private func verifyCode() {
-        isLoading = true
-        errorMessage = nil
+        guard let verificationId = verificationId, !verificationCode.isEmpty else { return }
         
-        authManager.verifyCode(code: verificationCode) { success, error in
-            isLoading = false
+        isVerifying = true
+        
+        let credential = PhoneAuthProvider.provider().credential(
+            withVerificationID: verificationId,
+            verificationCode: verificationCode
+        )
+        
+        Auth.auth().signIn(with: credential) { authResult, error in
+            isVerifying = false
             
-            if success {
-                presentationMode.wrappedValue.dismiss()
-            } else {
-                errorMessage = error ?? "Invalid verification code. Please try again."
+            if let error = error {
+                alertTitle = "Error"
+                alertMessage = "Failed to verify code: \(error.localizedDescription)"
+                showAlert = true
+                return
+            }
+            
+            // Update the auth manager
+            if let user = authResult?.user {
+                // Just update Firestore directly instead of using AuthManager
+                let db = Firestore.firestore()
+                if let userId = Auth.auth().currentUser?.uid {
+                    db.collection("users").document(userId).updateData([
+                        "phoneNumber": user.phoneNumber ?? phoneNumber
+                    ]) { error in
+                        if let error = error {
+                            alertTitle = "Warning"
+                            alertMessage = "Authentication successful but failed to update profile: \(error.localizedDescription)"
+                            showAlert = true
+                        } else {
+                            // Update successful - dismiss
+                            presentationMode.wrappedValue.dismiss()
+                        }
+                    }
+                }
             }
         }
     }
     
     private func formatPhoneNumber(_ number: String) -> String {
-        // Simple formatting - ensure it starts with "+" if not already
-        if number.hasPrefix("+") {
-            return number
-        } else if number.hasPrefix("1") {
-            return "+\(number)"
-        } else {
-            return "+1\(number)" // Default to US code
+        // Simple formatting - assumes US number
+        if !number.hasPrefix("+") {
+            if number.hasPrefix("1") {
+                return "+\(number)"
+            } else {
+                return "+1\(number)"
+            }
         }
+        return number
     }
 }
 

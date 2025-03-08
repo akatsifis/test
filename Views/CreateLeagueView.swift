@@ -2,7 +2,7 @@ import SwiftUI
 
 struct CreateLeagueView: View {
     @State private var searchQuery = ""
-    @State private var users: [User] = []
+    @State private var users: [Models.User] = []
     
     var body: some View {
         VStack {
@@ -25,23 +25,27 @@ struct CreateLeagueView: View {
                 HStack {
                     // Display Profile Picture
                     if let profilePicture = user.profilePicture {
-                        // Check if it's a valid image path or base64-encoded data
-                        if let imageData = Data(base64Encoded: profilePicture),
-                           let uiImage = UIImage(data: imageData) {
-                            // If profilePicture is base64 encoded, decode it to UIImage
-                            Image(uiImage: uiImage)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 50, height: 50)
-                        } else if let imagePath = user.profilePicture,
-                                  let uiImage = UIImage(contentsOfFile: imagePath) {
-                            // If it's a file path, load the image from the file system
-                            Image(uiImage: uiImage)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 50, height: 50)
+                        // Check if it's a valid URL
+                        if let url = URL(string: profilePicture) {
+                            AsyncImage(url: url) { phase in
+                                if let image = phase.image {
+                                    image
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: 50, height: 50)
+                                        .clipShape(Circle())
+                                } else if phase.error != nil {
+                                    Image(systemName: "person.circle.fill")
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: 50, height: 50)
+                                } else {
+                                    ProgressView()
+                                        .frame(width: 50, height: 50)
+                                }
+                            }
                         } else {
-                            // Fallback in case profilePicture is invalid
+                            // Fallback if profilePicture is not a valid URL
                             Image(systemName: "person.circle.fill")
                                 .resizable()
                                 .scaledToFit()
@@ -73,8 +77,14 @@ struct CreateLeagueView: View {
     
     // Search function to fetch users based on query
     private func searchUsers(query: String) {
-        UserService.shared.searchUsers(query: query) { fetchedUsers in
-            self.users = fetchedUsers
+        UserService.shared.searchUsers(query: query) { result in
+            switch result {
+            case .success(let fetchedUsers):
+                self.users = fetchedUsers
+            case .failure(let error):
+                print("Error searching users: \(error.localizedDescription)")
+                self.users = [] // Clear results on error
+            }
         }
     }
 }

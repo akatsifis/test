@@ -15,6 +15,7 @@ struct FriendsListView: View {
     @State private var friends: [Models.User] = []
     @State private var isLoading = false
     @State private var searchText = ""
+    @State private var currentUser: Models.User?
     
     var filteredFriends: [Models.User] {
         if searchText.isEmpty {
@@ -80,18 +81,23 @@ struct FriendsListView: View {
                             NavigationLink(destination: FriendDetailView(friend: friend)) {
                                 HStack {
                                     if let profilePicture = friend.profilePicture, let url = URL(string: profilePicture) {
-                                        AsyncImage(url: url) { image in
-                                            image
-                                                .resizable()
-                                                .scaledToFill()
-                                                .frame(width: 50, height: 50)
-                                                .clipShape(Circle())
-                                        } placeholder: {
-                                            Image(systemName: "person.circle.fill")
-                                                .resizable()
-                                                .scaledToFit()
-                                                .frame(width: 50, height: 50)
-                                                .foregroundColor(.gray)
+                                        AsyncImage(url: url) { phase in
+                                            if let image = phase.image {
+                                                image
+                                                    .resizable()
+                                                    .scaledToFill()
+                                                    .frame(width: 50, height: 50)
+                                                    .clipShape(Circle())
+                                            } else if phase.error != nil {
+                                                Image(systemName: "person.circle.fill")
+                                                    .resizable()
+                                                    .scaledToFit()
+                                                    .frame(width: 50, height: 50)
+                                                    .foregroundColor(.gray)
+                                            } else {
+                                                ProgressView()
+                                                    .frame(width: 50, height: 50)
+                                            }
                                         }
                                     } else {
                                         Image(systemName: "person.circle.fill")
@@ -127,7 +133,7 @@ struct FriendsListView: View {
             }
             .sheet(isPresented: $showAddUsers) {
                 NavigationView {
-                    AddUsersView()
+                    UserSearchView()
                         .navigationTitle("Add Friends")
                         .toolbar {
                             ToolbarItem(placement: .navigationBarLeading) {
@@ -139,25 +145,45 @@ struct FriendsListView: View {
                 }
             }
             .onAppear {
-                fetchFriends()
+                fetchCurrentUser()
             }
         }
     }
     
-    private func fetchFriends() {
-        guard let currentUser = authManager.currentUser else { return }
+    private func fetchCurrentUser() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
         
         isLoading = true
         
         let db = Firestore.firestore()
-        // For each friend ID in the user's friends list, fetch the corresponding user details
-        let friendIds = currentUser.friends
-        
+        db.collection("users").document(userId).getDocument { snapshot, error in
+            if let error = error {
+                print("Error fetching current user: \(error.localizedDescription)")
+                isLoading = false
+                return
+            }
+            
+            if let snapshot = snapshot, let data = snapshot.data() {
+                self.currentUser = Models.User.fromDictionary(data, id: snapshot.documentID)
+                
+                if let currentUser = self.currentUser {
+                    fetchFriends(friendIds: currentUser.friends)
+                } else {
+                    isLoading = false
+                }
+            } else {
+                isLoading = false
+            }
+        }
+    }
+    
+    private func fetchFriends(friendIds: [String]) {
         if friendIds.isEmpty {
             isLoading = false
             return
         }
         
+        let db = Firestore.firestore()
         let dispatchGroup = DispatchGroup()
         var fetchedFriends: [Models.User] = []
         
@@ -190,7 +216,7 @@ struct FriendsListView: View {
     }
     
     private func removeFriend(at offsets: IndexSet) {
-        guard let currentUser = authManager.currentUser, let currentUserId = Auth.auth().currentUser?.uid else { return }
+        guard let currentUser = currentUser, let userId = Auth.auth().currentUser?.uid else { return }
         
         let db = Firestore.firestore()
         
@@ -199,7 +225,7 @@ struct FriendsListView: View {
             let friendId = friendToRemove.id
             
             // Update current user's friends list
-            db.collection("users").document(currentUserId).updateData([
+            db.collection("users").document(userId).updateData([
                 "friends": FieldValue.arrayRemove([friendId])
             ]) { error in
                 if let error = error {
@@ -209,7 +235,7 @@ struct FriendsListView: View {
                 
                 // Update friend's friends list
                 db.collection("users").document(friendId).updateData([
-                    "friends": FieldValue.arrayRemove([currentUserId])
+                    "friends": FieldValue.arrayRemove([userId])
                 ]) { error in
                     if let error = error {
                         print("Error removing current user from friend: \(error.localizedDescription)")
@@ -234,20 +260,25 @@ struct FriendDetailView: View {
             VStack(alignment: .center, spacing: 20) {
                 // Profile picture
                 if let profilePicture = friend.profilePicture, let url = URL(string: profilePicture) {
-                    AsyncImage(url: url) { image in
-                        image
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 120, height: 120)
-                            .clipShape(Circle())
-                            .overlay(Circle().stroke(Color.blue, lineWidth: 3))
-                            .shadow(radius: 5)
-                    } placeholder: {
-                        Image(systemName: "person.circle.fill")
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 120, height: 120)
-                            .foregroundColor(.gray)
+                    AsyncImage(url: url) { phase in
+                        if let image = phase.image {
+                            image
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 120, height: 120)
+                                .clipShape(Circle())
+                                .overlay(Circle().stroke(Color.blue, lineWidth: 3))
+                                .shadow(radius: 5)
+                        } else if phase.error != nil {
+                            Image(systemName: "person.circle.fill")
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 120, height: 120)
+                                .foregroundColor(.gray)
+                        } else {
+                            ProgressView()
+                                .frame(width: 120, height: 120)
+                        }
                     }
                 } else {
                     Image(systemName: "person.circle.fill")
@@ -403,6 +434,208 @@ struct ScoreRow: View {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         return formatter
+    }
+}
+
+// This is a replacement for AddUsersView
+struct UserSearchView: View {
+    @State private var searchText = ""
+    @State private var searchResults: [Models.User] = []
+    @State private var isSearching = false
+    @State private var showingAlert = false
+    @State private var alertMessage = ""
+    
+    var body: some View {
+        VStack {
+            // Search bar
+            HStack {
+                Image(systemName: "magnifyingglass")
+                    .foregroundColor(.gray)
+                
+                TextField("Search by username, email, or phone", text: $searchText)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                
+                if !searchText.isEmpty {
+                    Button(action: {
+                        searchText = ""
+                        searchResults = []
+                    }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.gray)
+                    }
+                }
+            }
+            .padding()
+            .background(Color(.systemGray6))
+            .cornerRadius(10)
+            .padding(.horizontal)
+            .onChange(of: searchText) { value in
+                if value.count >= 3 {
+                    searchUsers()
+                }
+            }
+            
+            if isSearching {
+                ProgressView("Searching...")
+                    .padding()
+            } else if searchResults.isEmpty && !searchText.isEmpty {
+                Text("No users found")
+                    .foregroundColor(.gray)
+                    .padding(.top, 20)
+            } else {
+                List {
+                    ForEach(searchResults) { user in
+                        UserRowView(user: user, onSendRequest: { sendFriendRequest(to: user) })
+                    }
+                }
+                .listStyle(InsetGroupedListStyle())
+            }
+            
+            Spacer()
+        }
+        .navigationTitle("Add Friends")
+        .alert(isPresented: $showingAlert) {
+            Alert(title: Text("Friend Request"), message: Text(alertMessage), dismissButton: .default(Text("OK")))
+        }
+    }
+    
+    private func searchUsers() {
+        guard !searchText.isEmpty else { return }
+        
+        isSearching = true
+        searchResults = []
+        
+        UserService.shared.searchUsers(query: searchText) { result in
+            DispatchQueue.main.async {
+                self.isSearching = false
+                
+                switch result {
+                case .success(let users):
+                    // Filter out current user and existing friends
+                    guard let currentUserId = Auth.auth().currentUser?.uid else {
+                        self.searchResults = users
+                        return
+                    }
+                    
+                    let db = Firestore.firestore()
+                    db.collection("users").document(currentUserId).getDocument { snapshot, error in
+                        if let error = error {
+                            print("Error fetching current user: \(error.localizedDescription)")
+                            self.searchResults = users.filter { $0.id != currentUserId }
+                            return
+                        }
+                        
+                        if let data = snapshot?.data(), let userFriends = data["friends"] as? [String] {
+                            self.searchResults = users.filter { user in
+                                user.id != currentUserId && !userFriends.contains(user.id)
+                            }
+                        } else {
+                            self.searchResults = users.filter { $0.id != currentUserId }
+                        }
+                    }
+                    
+                case .failure(let error):
+                    self.alertMessage = "Error searching users: \(error.localizedDescription)"
+                    self.showingAlert = true
+                }
+            }
+        }
+    }
+    
+    private func sendFriendRequest(to user: Models.User) {
+        guard let currentUserId = Auth.auth().currentUser?.uid else {
+            alertMessage = "You must be logged in to send friend requests"
+            showingAlert = true
+            return
+        }
+        
+        let db = Firestore.firestore()
+        
+        // Create a friend request
+        let requestData: [String: Any] = [
+            "fromUserId": currentUserId,
+            "toUserId": user.id,
+            "status": "pending",
+            "timestamp": FieldValue.serverTimestamp()
+        ]
+        
+        db.collection("friendRequests").addDocument(data: requestData) { error in
+            if let error = error {
+                alertMessage = "Failed to send friend request: \(error.localizedDescription)"
+                showingAlert = true
+            } else {
+                alertMessage = "Friend request sent to \(user.username)"
+                showingAlert = true
+            }
+        }
+    }
+}
+
+struct UserRowView: View {
+    let user: Models.User
+    let onSendRequest: () -> Void
+    
+    var body: some View {
+        HStack {
+            if let profilePicture = user.profilePicture, let url = URL(string: profilePicture) {
+                AsyncImage(url: url) { phase in
+                    if let image = phase.image {
+                        image
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 50, height: 50)
+                            .clipShape(Circle())
+                    } else if phase.error != nil {
+                        Image(systemName: "person.circle.fill")
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 50, height: 50)
+                            .foregroundColor(.gray)
+                    } else {
+                        ProgressView()
+                            .frame(width: 50, height: 50)
+                    }
+                }
+            } else {
+                Image(systemName: "person.circle.fill")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 50, height: 50)
+                    .foregroundColor(.gray)
+            }
+            
+            VStack(alignment: .leading) {
+                Text(user.username)
+                    .font(.headline)
+                
+                if !user.firstName.isEmpty || !user.lastName.isEmpty {
+                    Text("\(user.firstName) \(user.lastName)")
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+                }
+                
+                if !user.phoneNumber.isEmpty {
+                    Text(user.phoneNumber)
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                }
+            }
+            
+            Spacer()
+            
+            Button(action: onSendRequest) {
+                Text("Add")
+                    .font(.footnote)
+                    .fontWeight(.semibold)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.blue)
+                    .foregroundColor(.white)
+                    .cornerRadius(12)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
 

@@ -117,13 +117,23 @@ struct LeaguePlayView: View {
                 .fontWeight(.bold)
                 .padding(.top, 50)
             
-            // "Create a League" button
-            NavigationLink("Create a League", destination: CreateLeagueView())
+            // "Create a League" button - using ImprovedCreateLeagueView
+            NavigationLink("Create a League", destination: ImprovedCreateLeagueView())
                 .font(.title2)
                 .frame(maxWidth: .infinity)
                 .padding()
                 .background(Color.green)
                 .foregroundColor(.black)
+                .cornerRadius(10)
+                .shadow(radius: 5)
+            
+            // "My Leagues" button
+            NavigationLink("My Leagues", destination: LeagueDashboardView())
+                .font(.title2)
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(Color.blue)
+                .foregroundColor(.white)
                 .cornerRadius(10)
                 .shadow(radius: 5)
 

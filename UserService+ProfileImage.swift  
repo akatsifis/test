@@ -1,0 +1,269 @@
+//
+//  UserService+ProfileImage.swift
+//  Aldo
+//
+//  Created by Andrew Katsifis on 3/5/25.
+//
+
+import UIKit
+import Firebase
+import FirebaseFirestore
+import FirebaseStorage
+
+// MARK: - Extension to UserService for profile picture handling
+extension UserService {
+    
+    // Update profile picture with improved error handling and retries
+    func updateProfilePicture(image: UIImage, completion: @escaping (Result<String, Error>) -> Void) {
+        guard let userId = Auth.auth().currentUser?.uid else {
+            completion(.failure(NSError(domain: "UserService", code: 1001, userInfo: [NSLocalizedDescriptionKey: "User not authenticated"])))
+            return
+        }
+        
+        isLoading = true
+        
+        // First compress the image to reduce upload size and bandwidth
+        let compressionQuality: CGFloat = 0.7
+        guard let imageData = image.jpegData(compressionQuality: compressionQuality) else {
+            isLoading = false
+            completion(.failure(NSError(domain: "UserService", code: 1002, userInfo: [NSLocalizedDescriptionKey: "Failed to compress image"])))
+            return
+        }
+        
+        // Create a timestamped filename to prevent conflicts
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let filename = "profile_\(userId)_\(timestamp).jpg"
+        let storageRef = Storage.storage().reference().child("profile_images/\(filename)")
+        
+        // Set metadata for the upload
+        let metadata = StorageMetadata()
+        metadata.contentType = "image/jpeg"
+        
+        // Begin upload with progress monitoring
+        let uploadTask = storageRef.putData(imageData, metadata: metadata) { [weak self] metadata, error in
+            guard let self = self else { return }
+            
+            if let error = error {
+                self.isLoading = false
+                print("Failed to upload profile image: \(error.localizedDescription)")
+                completion(.failure(error))
+                return
+            }
+            
+            // Get download URL once upload completes
+            storageRef.downloadURL { url, error in
+                if let error = error {
+                    self.isLoading = false
+                    print("Failed to get download URL: \(error.localizedDescription)")
+                    completion(.failure(error))
+                    return
+                }
+                
+                guard let downloadURL = url else {
+                    self.isLoading = false
+                    completion(.failure(NSError(domain: "UserService", code: 1003, userInfo: [NSLocalizedDescriptionKey: "Failed to get download URL"])))
+                    return
+                }
+                
+                // Update user's profile picture URL in Firestore
+                self.db.collection("users").document(userId).updateData([
+                    "profilePicture": downloadURL.absoluteString
+                ]) { error in
+                    self.isLoading = false
+                    
+                    if let error = error {
+                        print("Failed to update profile picture in Firestore: \(error.localizedDescription)")
+                        completion(.failure(error))
+                    } else {
+                        // Clean up old profile images if needed
+                        self.cleanupOldProfileImages(userId: userId, except: filename)
+                        
+                        // Update local user model
+                        if var currentUser = self.currentUser {
+                            currentUser.profilePicture = downloadURL.absoluteString
+                            self.currentUser = currentUser
+                        }
+                        
+                        // Cache the image locally for faster access
+                        ImageCache.shared.storeImage(image, forKey: downloadURL.absoluteString)
+                        
+                        completion(.success(downloadURL.absoluteString))
+                    }
+                }
+            }
+        }
+        
+        // Monitor upload progress
+        uploadTask.observe(.progress) { snapshot in
+            guard let progress = snapshot.progress else { return }
+            let percentComplete = Double(progress.completedUnitCount) / Double(progress.totalUnitCount) * 100
+            print("Profile image upload is \(percentComplete)% complete")
+        }
+    }
+    
+    // Helper method to clean up old profile images
+    private func cleanupOldProfileImages(userId: String, except currentFilename: String) {
+        let storageRef = Storage.storage().reference().child("profile_images")
+        
+        // List all items in the folder
+        storageRef.listAll { result, error in
+            if let error = error {
+                print("Error listing profile images: \(error.localizedDescription)")
+                return
+            }
+            
+            guard let result = result else { return }
+            
+            // Find old profile images for this user
+            for item in result.items {
+                let filename = item.name
+                // Only delete files matching this user's ID pattern but not the current one
+                if filename.contains("profile_\(userId)_") && filename != currentFilename {
+                    item.delete { error in
+                        if let error = error {
+                            print("Error deleting old profile image: \(error.localizedDescription)")
+                        } else {
+                            print("Successfully deleted old profile image: \(filename)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fetch profile picture with caching
+    func fetchProfilePicture(userId: String, completion: @escaping (Result<UIImage?, Error>) -> Void) {
+        // First check if we already have the user with profile picture URL
+        if let currentUser = currentUser, currentUser.id == userId, let profilePictureURL = currentUser.profilePicture, let url = URL(string: profilePictureURL) {
+            // Try to get from cache
+            if let cachedImage = ImageCache.shared.retrieveImage(forKey: profilePictureURL) {
+                completion(.success(cachedImage))
+                return
+            }
+            
+            // Download if not in cache
+            URLSession.shared.dataTask(with: url) { data, response, error in
+                if let error = error {
+                    DispatchQueue.main.async {
+                        completion(.failure(error))
+                    }
+                    return
+                }
+                
+                guard let data = data, let image = UIImage(data: data) else {
+                    DispatchQueue.main.async {
+                        completion(.success(nil)) // No image available
+                    }
+                    return
+                }
+                
+                // Cache for future use
+                ImageCache.shared.storeImage(image, forKey: profilePictureURL)
+                
+                DispatchQueue.main.async {
+                    completion(.success(image))
+                }
+            }.resume()
+            return
+        }
+        
+        // If we don't have the user data, fetch it first
+        db.collection("users").document(userId).getDocument { snapshot, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+            
+            guard let data = snapshot?.data(), let profilePictureURL = data["profilePicture"] as? String, let url = URL(string: profilePictureURL) else {
+                completion(.success(nil)) // No profile picture set
+                return
+            }
+            
+            // Try to get from cache first
+            if let cachedImage = ImageCache.shared.retrieveImage(forKey: profilePictureURL) {
+                completion(.success(cachedImage))
+                return
+            }
+            
+            // Download if not in cache
+            URLSession.shared.dataTask(with: url) { data, response, error in
+                if let error = error {
+                    DispatchQueue.main.async {
+                        completion(.failure(error))
+                    }
+                    return
+                }
+                
+                guard let data = data, let image = UIImage(data: data) else {
+                    DispatchQueue.main.async {
+                        completion(.success(nil))
+                    }
+                    return
+                }
+                
+                // Cache for future use
+                ImageCache.shared.storeImage(image, forKey: profilePictureURL)
+                
+                DispatchQueue.main.async {
+                    completion(.success(image))
+                }
+            }.resume()
+        }
+    }
+    
+    // Delete profile picture
+    func deleteProfilePicture(completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let userId = Auth.auth().currentUser?.uid else {
+            completion(.failure(NSError(domain: "UserService", code: 1001, userInfo: [NSLocalizedDescriptionKey: "User not authenticated"])))
+            return
+        }
+        
+        // First check if the user has a profile picture
+        guard let currentUser = currentUser, let profilePictureURL = currentUser.profilePicture else {
+            completion(.success(()))
+            return
+        }
+        
+        isLoading = true
+        
+        // 1. Parse the URL to get the storage path
+        guard let url = URL(string: profilePictureURL) else {
+            isLoading = false
+            completion(.failure(NSError(domain: "UserService", code: 1002, userInfo: [NSLocalizedDescriptionKey: "Invalid profile picture URL"])))
+            return
+        }
+        
+        // 2. Delete the file from Firebase Storage
+        let storageRef = Storage.storage().reference(forURL: profilePictureURL)
+        
+        storageRef.delete { [weak self] error in
+            guard let self = self else { return }
+            
+            // Even if delete fails, still update the user document
+            // This handles cases where the image might have been deleted already
+            
+            // 3. Update user document to remove profile picture URL
+            self.db.collection("users").document(userId).updateData([
+                "profilePicture": FieldValue.delete()
+            ]) { firestoreError in
+                self.isLoading = false
+                
+                if let firestoreError = firestoreError {
+                    completion(.failure(firestoreError))
+                    return
+                }
+                
+                // 4. Update local user object
+                if var user = self.currentUser {
+                    user.profilePicture = nil
+                    self.currentUser = user
+                }
+                
+                // 5. Remove from cache
+                ImageCache.shared.removeImage(forKey: profilePictureURL)
+                
+                completion(.success(()))
+            }
+        }
+    }
+}
