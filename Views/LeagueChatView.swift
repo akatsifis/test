@@ -1,6 +1,7 @@
 import SwiftUI
 import Firebase
 import FirebaseFirestore
+import PhotosUI
 
 struct LeagueChatView: View {
     @State private var message = ""
@@ -8,169 +9,319 @@ struct LeagueChatView: View {
     @State private var isLoading = true
     @State private var showingAttachmentOptions = false
     @State private var showingRSVPSheet = false
+    @State private var showingImagePicker = false
+    @State private var selectedImage: UIImage? = nil
+    @State private var isUploading = false
+    @State private var scrollToBottom = false
+    
+    // For message moderation/deletion (host only)
+    @State private var selectedMessage: LeagueMessage? = nil
+    @State private var showingMessageOptions = false
+    
+    // Message listening
+    @State private var isHost: Bool = false
+    @State private var messagesListener: ListenerRegistration?
     
     let leagueId: String
     let leagueName: String
     
     var body: some View {
         VStack {
-            // Header with RSVP button
-            HStack {
-                Text(leagueName)
-                    .font(.headline)
-                
-                Spacer()
-                
-                Button(action: {
-                    showingRSVPSheet = true
-                }) {
-                    Text("RSVP")
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color.green)
-                        .foregroundColor(.white)
-                        .cornerRadius(8)
-                }
-            }
-            .padding(.horizontal)
+            // Chat header with RSVP button
+            leagueChatHeader
             
             // Chat messages
-            if isLoading {
-                ProgressView("Loading messages...")
-                    .padding()
-            } else if messages.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "bubble.left.and.bubble.right")
-                        .font(.system(size: 50))
-                        .foregroundColor(.gray)
-                        .padding()
-                    
-                    Text("No messages yet")
-                        .foregroundColor(.gray)
-                    
-                    Text("Be the first to send a message!")
-                        .font(.caption)
-                        .foregroundColor(.gray)
-                }
-                .padding()
-            } else {
-                ScrollViewReader { scrollView in
-                    ScrollView {
-                        LazyVStack(spacing: 12) {
-                            ForEach(messages) { message in
-                                MessageRow(message: message)
-                                    .id(message.id)
-                            }
-                        }
-                        .padding(.horizontal)
-                        .padding(.top, 8)
-                    }
-                    .onChange(of: messages.count) { _ in
-                        if let lastMessage = messages.last {
-                            withAnimation {
-                                scrollView.scrollTo(lastMessage.id, anchor: .bottom)
-                            }
-                        }
-                    }
-                }
-            }
+            messagesView
             
             // Message input
-            VStack(spacing: 0) {
-                Divider()
-                
-                HStack {
-                    Button(action: {
-                        showingAttachmentOptions = true
-                    }) {
-                        Image(systemName: "plus.circle.fill")
-                            .font(.system(size: 24))
-                            .foregroundColor(.blue)
-                    }
-                    .padding(.leading, 10)
-                    
-                    TextField("Type a message...", text: $message)
-                        .padding(10)
-                        .background(Color(.systemGray6))
-                        .cornerRadius(20)
-                    
-                    Button(action: sendMessage) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 24))
-                            .foregroundColor(message.isEmpty ? .gray : .blue)
-                    }
-                    .disabled(message.isEmpty)
-                    .padding(.trailing, 10)
-                }
-                .padding(.vertical, 10)
-                .padding(.horizontal, 5)
-                .background(Color(.systemBackground))
-            }
+            messageInputView
         }
-        .onAppear(perform: loadMessages)
-        .sheet(isPresented: $showingAttachmentOptions) {
-            AttachmentOptionsView { optionSelected in
-                showingAttachmentOptions = false
-                handleAttachmentOption(optionSelected)
-            }
+        .onAppear {
+            loadMessages()
+            checkIfHost()
+        }
+        .onDisappear {
+            // Clean up listener when view disappears
+            messagesListener?.remove()
         }
         .sheet(isPresented: $showingRSVPSheet) {
             RSVPView(leagueId: leagueId)
         }
+        .sheet(isPresented: $showingImagePicker) {
+            ImagePicker(image: $selectedImage)
+                .onDisappear {
+                    if let image = selectedImage {
+                        uploadImage(image)
+                    }
+                }
+        }
+        .actionSheet(isPresented: $showingAttachmentOptions) {
+            ActionSheet(
+                title: Text("Add to Message"),
+                buttons: [
+                    .default(Text("Photo")) { showingImagePicker = true },
+                    .default(Text("Submit Score")) { /* Navigate to score submission */ },
+                    .default(Text("Share Location")) { /* Share location feature */ },
+                    .cancel()
+                ]
+            )
+        }
+        .actionSheet(isPresented: $showingMessageOptions, content: {
+            guard let message = selectedMessage else {
+                return ActionSheet(title: Text("Message Options"), buttons: [.cancel()])
+            }
+            
+            return ActionSheet(
+                title: Text("Message Options"),
+                message: Text("Select an action for this message"),
+                buttons: [
+                    .destructive(Text("Delete Message")) {
+                        deleteMessage(message)
+                    },
+                    isHost ? .default(Text("Pin Message")) { pinMessage(message) } : nil,
+                    .cancel()
+                ].compactMap { $0 }
+            )
+        })
     }
     
-    private func loadMessages() {
-        guard !leagueId.isEmpty else { return }
-        
-        let db = Firestore.firestore()
-        db.collection("leagues").document(leagueId).collection("messages")
-            .order(by: "timestamp", descending: false)
-            .limit(to: 100)
-            .addSnapshotListener { snapshot, error in
-                isLoading = false
-                
-                if let error = error {
-                    print("Error loading messages: \(error.localizedDescription)")
-                    return
-                }
-                
-                guard let documents = snapshot?.documents else { return }
-                
-                self.messages = documents.compactMap { document -> LeagueMessage? in
-                    let data = document.data()
-                    
-                    guard let userId = data["userId"] as? String,
-                          let username = data["username"] as? String,
-                          let text = data["text"] as? String,
-                          let timestamp = data["timestamp"] as? Timestamp else {
-                        return nil
+    // MARK: - UI Components
+    
+    private var leagueChatHeader: some View {
+        HStack {
+            Text(leagueName)
+                .font(.headline)
+            
+            Spacer()
+            
+            Button(action: {
+                showingRSVPSheet = true
+            }) {
+                Text("RSVP")
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.green)
+                    .foregroundColor(.white)
+                    .cornerRadius(8)
+            }
+        }
+        .padding(.horizontal)
+    }
+    
+    private var messagesView: some View {
+        ScrollViewReader { scrollView in
+            ScrollView {
+                if isLoading {
+                    ProgressView("Loading messages...")
+                        .padding()
+                } else if messages.isEmpty {
+                    emptyMessagesView
+                } else {
+                    LazyVStack(spacing: 12) {
+                        ForEach(messages) { message in
+                            MessageRow(message: message, isHost: isHost)
+                                .id(message.id)
+                                .contextMenu {
+                                    if isHost || message.userId == Auth.auth().currentUser?.uid {
+                                        Button(action: {
+                                            selectedMessage = message
+                                            showingMessageOptions = true
+                                        }) {
+                                            Label("Message Options", systemImage: "ellipsis.circle")
+                                        }
+                                    }
+                                }
+                        }
                     }
-                    
-                    let imageUrl = data["imageUrl"] as? String
-                    let isRSVP = data["isRSVP"] as? Bool ?? false
-                    let rsvpStatus = data["rsvpStatus"] as? String
-                    
-                    return LeagueMessage(
-                        id: document.documentID,
-                        userId: userId,
-                        username: username,
-                        text: text,
-                        timestamp: timestamp.dateValue(),
-                        imageUrl: imageUrl,
-                        isRSVP: isRSVP,
-                        rsvpStatus: rsvpStatus
-                    )
+                    .padding(.horizontal)
+                    .padding(.top, 8)
+                    .padding(.bottom, 12)
                 }
             }
+            .onChange(of: messages.count) { _ in
+                if scrollToBottom {
+                    withAnimation {
+                        if let lastMessage = messages.last {
+                            scrollView.scrollTo(lastMessage.id, anchor: .bottom)
+                        }
+                    }
+                    scrollToBottom = false
+                }
+            }
+            .onAppear {
+                // Scroll to bottom on initial load
+                if !messages.isEmpty {
+                    DispatchQueue.main.async {
+                        withAnimation {
+                            scrollView.scrollTo(messages.last!.id, anchor: .bottom)
+                        }
+                    }
+                }
+            }
+        }
     }
     
-    private func sendMessage() {
-        guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+    private var emptyMessagesView: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.system(size: 50))
+                .foregroundColor(.gray)
+                .padding()
+            
+            Text("No messages yet")
+                .foregroundColor(.gray)
+            
+            Text("Be the first to send a message!")
+                .font(.caption)
+                .foregroundColor(.gray)
+        }
+        .padding()
+    }
+    
+    private var messageInputView: some View {
+        VStack(spacing: 0) {
+            Divider()
+            
+            // Input area
+            HStack(alignment: .bottom) {
+                Button(action: {
+                    showingAttachmentOptions = true
+                }) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 24))
+                        .foregroundColor(.blue)
+                }
+                .padding(.leading, 10)
+                
+                if isUploading {
+                    HStack {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle())
+                        Text("Uploading...")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                    }
+                    .padding(10)
+                    .background(Color(.systemGray6))
+                    .cornerRadius(20)
+                } else {
+                    ZStack(alignment: .leading) {
+                        if message.isEmpty {
+                            Text("Type a message...")
+                                .foregroundColor(.gray)
+                                .padding(.leading, 15)
+                                .padding(.top, 10)
+                        }
+                        
+                        TextEditor(text: $message)
+                            .padding(4)
+                            .frame(minHeight: 40, maxHeight: 120)
+                            .background(Color.clear)
+                            .opacity(message.isEmpty ? 0.7 : 1)
+                    }
+                    .padding(5)
+                    .background(Color(.systemGray6))
+                    .cornerRadius(20)
+                }
+                
+                Button(action: sendMessage) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 30))
+                        .foregroundColor(message.isEmpty ? .gray : .blue)
+                }
+                .disabled(message.isEmpty)
+                .padding(.trailing, 10)
+            }
+            .padding(.vertical, 8)
+            .background(Color(.systemBackground))
+        }
+    }
+}
+
+
+// MARK: - Data Functions for LeagueChatView
+
+extension LeagueChatView {
+    func loadMessages() {
+        guard !leagueId.isEmpty else { return }
+        
+        isLoading = true
+        
+        // Cancel existing listener if any
+        messagesListener?.remove()
+        
+        // Set up a new listener
+        messagesListener = EnhancedLeagueService.shared.listenForMessages(leagueId: leagueId) { result in
+            DispatchQueue.main.async {
+                self.isLoading = false
+                
+                switch result {
+                case .success(let fetchedMessages):
+                    // Convert EnhancedLeagueMessage to LeagueMessage
+                    self.messages = fetchedMessages.map { message in
+                        return LeagueMessage(
+                            id: message.id,
+                            userId: message.userId,
+                            username: message.username,
+                            text: message.text,
+                            timestamp: message.timestamp,
+                            imageUrl: message.imageUrl,
+                            isRSVP: message.isRsvp,
+                            rsvpStatus: message.rsvpStatus,
+                            isScoreSubmission: message.isScoreSubmission,
+                            submittedScore: message.submittedScore,
+                            profilePictureUrl: message.profilePictureUrl,
+                            isPinned: false  // Default to false, update if needed
+                        )
+                    }
+                    
+                    // Sort messages with pinned ones at the top, then by timestamp
+                    self.messages.sort { (msg1, msg2) -> Bool in
+                        if msg1.isPinned && !msg2.isPinned {
+                            return true
+                        } else if !msg1.isPinned && msg2.isPinned {
+                            return false
+                        } else {
+                            return msg1.timestamp < msg2.timestamp
+                        }
+                    }
+                    
+                case .failure(let error):
+                    print("Error loading messages: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+    
+    func checkIfHost() {
+        guard let currentUserId = Auth.auth().currentUser?.uid else { return }
+        
+        let db = Firestore.firestore()
+        db.collection("leagues").document(leagueId).getDocument { snapshot, error in
+            if let error = error {
+                print("Error checking host status: \(error.localizedDescription)")
+                return
+            }
+            
+            if let data = snapshot?.data(), let hostId = data["hostUserId"] as? String {
+                self.isHost = (hostId == currentUserId)
+            }
+        }
+    }
+    
+    func sendMessage() {
+        let messageText = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !messageText.isEmpty,
               !leagueId.isEmpty,
               let userId = Auth.auth().currentUser?.uid else {
             return
         }
         
+        // Save the message text and clear the input field
+        let currentMessage = messageText
+        message = ""
+        scrollToBottom = true
+        
         // Get current user data
         let db = Firestore.firestore()
         db.collection("users").document(userId).getDocument { snapshot, error in
@@ -185,432 +336,123 @@ struct LeagueChatView: View {
                 return
             }
             
-            // Create message document
-            let messageData: [String: Any] = [
-                "userId": userId,
-                "username": username,
-                "text": message,
-                "timestamp": FieldValue.serverTimestamp(),
-                "isRSVP": false
-            ]
+            let profilePictureUrl = data["profilePicture"] as? String
             
-            // Add to Firestore
-            db.collection("leagues").document(leagueId).collection("messages")
-                .addDocument(data: messageData) { error in
-                    if let error = error {
-                        print("Error sending message: \(error.localizedDescription)")
-                    } else {
-                        message = ""
-                    }
+            // Create an EnhancedLeagueMessage
+            let leagueMessage = EnhancedLeagueMessage(
+                id: UUID().uuidString,
+                userId: userId,
+                username: username,
+                text: currentMessage,
+                timestamp: Date(),
+                imageUrl: nil,
+                isRsvp: false,
+                rsvpStatus: nil,
+                isScoreSubmission: false,
+                submittedScore: nil,
+                profilePictureUrl: profilePictureUrl
+            )
+            
+            // Post the message using the service
+            EnhancedLeagueService.shared.postLeagueMessage(leagueId: leagueId, message: leagueMessage) { result in
+                switch result {
+                case .success:
+                    print("Message sent successfully")
+                case .failure(let error):
+                    print("Error sending message: \(error.localizedDescription)")
                 }
-        }
-    }
-    
-    private func handleAttachmentOption(_ option: AttachmentOption) {
-        switch option {
-        case .photo:
-            // Handle photo attachment
-            print("Photo attachment selected")
-        case .location:
-            // Handle location sharing
-            print("Location sharing selected")
-        case .poll:
-            // Handle poll creation
-            print("Poll creation selected")
-        }
-    }
-}
-
-// MARK: - Supporting Views and Models
-
-struct MessageRow: View {
-    let message: LeagueMessage
-    @State private var isCurrentUser = false
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            // RSVP Message
-            if message.isRSVP {
-                RSVPMessageView(message: message)
             }
-            // Regular Message
-            else {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(message.username)
-                            .font(.caption)
-                            .fontWeight(.bold)
-                            .foregroundColor(.gray)
-                        
-                        // Message content
-                        Text(message.text)
-                            .padding(10)
-                            .background(isCurrentUser ? Color.blue.opacity(0.2) : Color(.systemGray6))
-                            .cornerRadius(12)
-                        
-                        // Image if present
-                        if let imageUrl = message.imageUrl, let url = URL(string: imageUrl) {
-                            AsyncImage(url: url) { phase in
-                                if let image = phase.image {
-                                    image
-                                        .resizable()
-                                        .aspectRatio(contentMode: .fill)
-                                        .frame(maxWidth: 200, maxHeight: 200)
-                                        .cornerRadius(12)
-                                } else if phase.error != nil {
-                                    Image(systemName: "photo")
-                                        .frame(width: 200, height: 200)
-                                        .background(Color.gray.opacity(0.3))
-                                        .cornerRadius(12)
-                                } else {
-                                    ProgressView()
-                                        .frame(width: 200, height: 200)
-                                        .background(Color.gray.opacity(0.1))
-                                        .cornerRadius(12)
-                                }
-                            }
-                        }
-                        
-                        Text(formatDate(message.timestamp))
-                            .font(.caption2)
-                            .foregroundColor(.gray)
-                    }
+        }
+    }
+    
+    func uploadImage(_ image: UIImage) {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        
+        isUploading = true
+        
+        // Upload image
+        ImageUploadService.shared.uploadImage(
+            image: image,
+            path: "league_messages/\(leagueId)",
+            compressionQuality: 0.7
+        ) { result in
+            DispatchQueue.main.async {
+                self.isUploading = false
+                self.selectedImage = nil
+                
+                switch result {
+                case .success(let imageUrl):
+                    // Now send a message with the image URL
+                    self.sendMessageWithImage(imageUrl)
                     
-                    Spacer()
+                case .failure(let error):
+                    print("Error uploading image: \(error.localizedDescription)")
                 }
             }
         }
-        .onAppear {
-            isCurrentUser = message.userId == Auth.auth().currentUser?.uid
-        }
-        .padding(.horizontal, 4)
     }
     
-    private func formatDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeStyle = .short
+    func sendMessageWithImage(_ imageUrl: String) {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
         
-        // If message is from today, just show time
-        if Calendar.current.isDateInToday(date) {
-            return formatter.string(from: date)
-        }
-        
-        // Otherwise show date and time
-        formatter.dateStyle = .short
-        return formatter.string(from: date)
-    }
-}
-
-struct RSVPMessageView: View {
-    let message: LeagueMessage
-    
-    var body: some View {
-        HStack {
-            Image(systemName: rsvpIcon)
-                .foregroundColor(rsvpColor)
-            
-            VStack(alignment: .leading, spacing: 2) {
-                Text("\(message.username) is \(rsvpText) for league night")
-                    .font(.subheadline)
-                
-                if !message.text.isEmpty {
-                    Text("Note: \"\(message.text)\"")
-                        .font(.caption)
-                        .italic()
-                }
-                
-                Text(formatDate(message.timestamp))
-                    .font(.caption2)
-                    .foregroundColor(.gray)
-            }
-            
-            Spacer()
-        }
-        .padding(8)
-        .background(Color.gray.opacity(0.1))
-        .cornerRadius(8)
-    }
-    
-    private var rsvpText: String {
-        guard let status = message.rsvpStatus else { return "undecided" }
-        switch status {
-        case "attending": return "attending"
-        case "notAttending": return "not attending"
-        case "maybe": return "possibly attending"
-        default: return "undecided"
-        }
-    }
-    
-    private var rsvpIcon: String {
-        guard let status = message.rsvpStatus else { return "questionmark.circle" }
-        switch status {
-        case "attending": return "checkmark.circle.fill"
-        case "notAttending": return "xmark.circle.fill"
-        case "maybe": return "questionmark.circle.fill"
-        default: return "questionmark.circle"
-        }
-    }
-    
-    private var rsvpColor: Color {
-        guard let status = message.rsvpStatus else { return .gray }
-        switch status {
-        case "attending": return .green
-        case "notAttending": return .red
-        case "maybe": return .orange
-        default: return .gray
-        }
-    }
-    
-    private func formatDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeStyle = .short
-        formatter.dateStyle = .short
-        return formatter.string(from: date)
-    }
-}
-
-struct AttachmentOptionsView: View {
-    let onOptionSelected: (AttachmentOption) -> Void
-    
-    var body: some View {
-        VStack(spacing: 20) {
-            Text("Add to message")
-                .font(.headline)
-                .padding(.top)
-            
-            HStack(spacing: 30) {
-                AttachmentButton(option: .photo, icon: "photo", color: .blue, onOptionSelected: onOptionSelected)
-                AttachmentButton(option: .location, icon: "location.fill", color: .red, onOptionSelected: onOptionSelected)
-                AttachmentButton(option: .poll, icon: "chart.bar", color: .purple, onOptionSelected: onOptionSelected)
-            }
-            .padding()
-            
-            Spacer()
-        }
-        .padding()
-    }
-}
-
-struct AttachmentButton: View {
-    let option: AttachmentOption
-    let icon: String
-    let color: Color
-    let onOptionSelected: (AttachmentOption) -> Void
-    
-    var body: some View {
-        Button(action: {
-            onOptionSelected(option)
-        }) {
-            VStack {
-                Circle()
-                    .fill(color.opacity(0.2))
-                    .frame(width: 60, height: 60)
-                    .overlay(
-                        Image(systemName: icon)
-                            .font(.system(size: 24))
-                            .foregroundColor(color)
-                    )
-                
-                Text(option.title)
-                    .font(.caption)
-                    .foregroundColor(.primary)
-            }
-        }
-    }
-}
-
-struct RSVPView: View {
-    let leagueId: String
-    @State private var selectedStatus: RSVPStatus = .attending
-    @State private var note: String = ""
-    @State private var isSubmitting = false
-    @State private var showingConfirmation = false
-    @Environment(\.presentationMode) var presentationMode
-    
-    var body: some View {
-        NavigationView {
-            Form {
-                Section(header: Text("Will you attend the next league night?")) {
-                    Picker("Attendance", selection: $selectedStatus) {
-                        ForEach(RSVPStatus.allCases) { status in
-                            HStack {
-                                Image(systemName: status.icon)
-                                    .foregroundColor(status.color)
-                                Text(status.title)
-                            }
-                            .tag(status)
-                        }
-                    }
-                    .pickerStyle(MenuPickerStyle())
-                }
-                
-                Section(header: Text("Add a note (optional)")) {
-                    TextEditor(text: $note)
-                        .frame(height: 100)
-                    
-                    Text("\(note.count)/100 characters")
-                        .font(.caption)
-                        .foregroundColor(note.count > 100 ? .red : .gray)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                }
-                
-                Section {
-                    Button(action: submitRSVP) {
-                        if isSubmitting {
-                            ProgressView()
-                                .frame(maxWidth: .infinity)
-                        } else {
-                            Text("Submit RSVP")
-                                .frame(maxWidth: .infinity)
-                                .foregroundColor(.white)
-                        }
-                    }
-                    .padding()
-                    .listRowBackground(
-                        Rectangle()
-                            .fill(isSubmitting || note.count > 100 ? Color.gray : selectedStatus.color)
-                            .cornerRadius(8)
-                    )
-                    .disabled(isSubmitting || note.count > 100)
-                }
-            }
-            .navigationTitle("RSVP for League Night")
-            .navigationBarItems(trailing: Button("Cancel") {
-                presentationMode.wrappedValue.dismiss()
-            })
-            .alert(isPresented: $showingConfirmation) {
-                Alert(
-                    title: Text("RSVP Submitted"),
-                    message: Text("Your RSVP has been recorded."),
-                    dismissButton: .default(Text("OK")) {
-                        presentationMode.wrappedValue.dismiss()
-                    }
-                )
-            }
-        }
-    }
-    
-    private func submitRSVP() {
-        guard !isSubmitting, note.count <= 100, let userId = Auth.auth().currentUser?.uid else { return }
-        
-        isSubmitting = true
-        
-        // Get current user data
         let db = Firestore.firestore()
         db.collection("users").document(userId).getDocument { snapshot, error in
-            if let error = error {
-                print("Error fetching user data: \(error.localizedDescription)")
-                isSubmitting = false
-                return
-            }
-            
             guard let data = snapshot?.data(),
                   let username = data["username"] as? String else {
-                print("User data not found")
-                isSubmitting = false
                 return
             }
             
-            // Save RSVP to league member collection
-            let rsvpData: [String: Any] = [
-                "status": selectedStatus.rawValue,
-                "note": note,
-                "timestamp": FieldValue.serverTimestamp()
-            ]
+            let profilePictureUrl = data["profilePicture"] as? String
+            let messageText = self.message.isEmpty ? "Shared an image" : self.message
             
-            db.collection("leagues").document(leagueId)
-                .collection("members").document(userId)
-                .updateData(["rsvp": rsvpData]) { error in
-                    if let error = error {
-                        print("Error updating RSVP status: \(error.localizedDescription)")
-                        isSubmitting = false
-                        return
-                    }
-                    
-                    // Also add RSVP message to chat
-                    let messageData: [String: Any] = [
-                        "userId": userId,
-                        "username": username,
-                        "text": note,
-                        "timestamp": FieldValue.serverTimestamp(),
-                        "isRSVP": true,
-                        "rsvpStatus": selectedStatus.rawValue
-                    ]
-                    
-                    db.collection("leagues").document(leagueId)
-                        .collection("messages").addDocument(data: messageData) { error in
-                            isSubmitting = false
-                            
-                            if let error = error {
-                                print("Error sending RSVP message: \(error.localizedDescription)")
-                            } else {
-                                showingConfirmation = true
-                            }
-                        }
+            // Create the message with image URL
+            let leagueMessage = EnhancedLeagueMessage(
+                id: UUID().uuidString,
+                userId: userId,
+                username: username,
+                text: messageText,
+                timestamp: Date(),
+                imageUrl: imageUrl,
+                isRsvp: false,
+                rsvpStatus: nil,
+                isScoreSubmission: false,
+                submittedScore: nil,
+                profilePictureUrl: profilePictureUrl
+            )
+            
+            // Post the message
+            EnhancedLeagueService.shared.postLeagueMessage(leagueId: self.leagueId, message: leagueMessage) { _ in
+                DispatchQueue.main.async {
+                    self.message = ""
+                    self.scrollToBottom = true
                 }
-        }
-    }
-}
-
-// MARK: - Models
-
-struct LeagueMessage: Identifiable {
-    let id: String
-    let userId: String
-    let username: String
-    let text: String
-    let timestamp: Date
-    let imageUrl: String?
-    let isRSVP: Bool
-    let rsvpStatus: String?
-}
-
-enum AttachmentOption {
-    case photo, location, poll
-    
-    var title: String {
-        switch self {
-        case .photo: return "Photo"
-        case .location: return "Location"
-        case .poll: return "Poll"
-        }
-    }
-}
-
-enum RSVPStatus: String, CaseIterable, Identifiable {
-    case attending
-    case notAttending
-    case maybe
-    
-    var id: String { self.rawValue }
-    
-    var title: String {
-        switch self {
-        case .attending: return "Yes, I'll be there"
-        case .notAttending: return "No, I can't make it"
-        case .maybe: return "Maybe"
+            }
         }
     }
     
-    var icon: String {
-        switch self {
-        case .attending: return "checkmark.circle.fill"
-        case .notAttending: return "xmark.circle.fill"
-        case .maybe: return "questionmark.circle.fill"
-        }
+    func deleteMessage(_ message: LeagueMessage) {
+        guard isHost || message.userId == Auth.auth().currentUser?.uid else { return }
+        
+        let db = Firestore.firestore()
+        db.collection("leagues").document(leagueId)
+            .collection("messages").document(message.id)
+            .delete { error in
+                if let error = error {
+                    print("Error deleting message: \(error.localizedDescription)")
+                }
+            }
     }
     
-    var color: Color {
-        switch self {
-        case .attending: return .green
-        case .notAttending: return .red
-        case .maybe: return .orange
-        }
-    }
-}
-
-struct LeagueChatView_Previews: PreviewProvider {
-    static var previews: some View {
-        LeagueChatView(leagueId: "preview-league-id", leagueName: "Tuesday Night League")
+    func pinMessage(_ message: LeagueMessage) {
+        guard isHost else { return }
+        
+        let db = Firestore.firestore()
+        db.collection("leagues").document(leagueId)
+            .collection("messages").document(message.id)
+            .updateData(["isPinned": true]) { error in
+                if let error = error {
+                    print("Error pinning message: \(error.localizedDescription)")
+                }
+            }
     }
 }
