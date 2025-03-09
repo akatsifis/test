@@ -5,7 +5,8 @@ import PhotosUI
 struct ImprovedCreateLeagueView: View {
     // League details
     @State private var leagueName = ""
-    @State private var selectedCourse = ""
+    @State private var selectedCourse: GolfCourse?
+    @State private var showingCourseSelector = false
     @State private var leagueDescription = ""
     @State private var leaguePhoto: UIImage?
     @State private var showingPhotoPicker = false
@@ -28,9 +29,12 @@ struct ImprovedCreateLeagueView: View {
     @State private var showingSuccessAlert = false
     @State private var isCreating = false
     
-    // Course options
-    let courses = ["Armitage Golf Club", "Rich Valley Golf", "Dauphin Highlands",
-                  "Cumberland Golf Club", "Mayapple Golf Club"]
+    // Environment objects
+    @EnvironmentObject private var locationManager: AppLocationManager
+    
+    // Load nearby courses when view appears
+    @State private var nearbyCoursesLoaded = false
+    @State private var nearbyCourses: [GolfCourse] = []
     
     enum PlayFrequency: String, CaseIterable, Identifiable {
         case weekly = "Weekly"
@@ -79,16 +83,110 @@ struct ImprovedCreateLeagueView: View {
                     .background(Color.gray.opacity(0.2))
                     .cornerRadius(8)
                 
-                Picker("Golf Course", selection: $selectedCourse) {
-                    Text("Select a course").tag("")
-                    ForEach(courses, id: \.self) { course in
-                        Text(course).tag(course)
+                // Course Selection - Now with nearby courses suggestion
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("HOME COURSE")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                        
+                        if locationManager.currentLocation != nil && !nearbyCourses.isEmpty {
+                            Spacer()
+                            Text("Nearby Courses Found")
+                                .font(.caption)
+                                .foregroundColor(.green)
+                        }
+                    }
+                    
+                    // Selected course or button to select
+                    if let course = selectedCourse {
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text(course.Name)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.primary)
+                                Text("\(course.City), \(course.State)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                
+                                if let distance = locationManager.distance(to: course.coordinate) {
+                                    Text(String(format: "%.1f miles away", distance / 1609.344))
+                                        .font(.caption)
+                                        .foregroundColor(.green)
+                                }
+                            }
+                            
+                            Spacer()
+                            
+                            Button(action: {
+                                showingCourseSelector = true
+                            }) {
+                                Text("Change")
+                                    .foregroundColor(.blue)
+                            }
+                        }
+                        .padding()
+                        .background(Color.gray.opacity(0.1))
+                        .cornerRadius(8)
+                    } else {
+                        Button(action: {
+                            showingCourseSelector = true
+                        }) {
+                            HStack {
+                                Image(systemName: "mappin.and.ellipse")
+                                    .foregroundColor(.green)
+                                
+                                Text("Select a course")
+                                    .foregroundColor(.primary)
+                                
+                                Spacer()
+                                
+                                Image(systemName: "chevron.right")
+                                    .foregroundColor(.gray)
+                            }
+                            .padding()
+                            .background(Color.gray.opacity(0.2))
+                            .cornerRadius(8)
+                        }
+                    }
+                    
+                    // Show nearby courses if available
+                    if locationManager.currentLocation != nil && !nearbyCourses.isEmpty && selectedCourse == nil {
+                        Text("NEARBY COURSES")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                            .padding(.top, 5)
+                        
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 10) {
+                                ForEach(nearbyCourses.prefix(5), id: \.id) { course in
+                                    Button(action: {
+                                        selectedCourse = course
+                                    }) {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(course.Name)
+                                                .font(.subheadline)
+                                                .fontWeight(.medium)
+                                                .multilineTextAlignment(.leading)
+                                                .lineLimit(2)
+                                            
+                                            if let distance = locationManager.distance(to: course.coordinate) {
+                                                Text(String(format: "%.1f mi", distance / 1609.344))
+                                                    .font(.caption)
+                                                    .foregroundColor(.green)
+                                            }
+                                        }
+                                        .frame(width: 120, alignment: .leading)
+                                        .padding(8)
+                                        .background(Color.gray.opacity(0.1))
+                                        .cornerRadius(8)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 5)
+                        }
                     }
                 }
-                .pickerStyle(MenuPickerStyle())
-                .padding()
-                .background(Color.gray.opacity(0.2))
-                .cornerRadius(8)
                 
                 TextField("League Description (optional)", text: $leagueDescription)
                     .padding()
@@ -157,6 +255,16 @@ struct ImprovedCreateLeagueView: View {
             .sheet(isPresented: $showingPhotoPicker) {
                 PHPickerViewRepresentable(image: $leaguePhoto)
             }
+            .sheet(isPresented: $showingCourseSelector) {
+                NavigationView {
+                    CourseSearchView(selectedCourse: $selectedCourse)
+                        .navigationTitle("Select a Course")
+                        .navigationBarItems(trailing: Button("Done") {
+                            showingCourseSelector = false
+                        })
+                        .environmentObject(locationManager)
+                }
+            }
             .alert(isPresented: $showAlert) {
                 Alert(title: Text("League Creation"), message: Text(alertMessage), dismissButton: .default(Text("OK")))
             }
@@ -167,6 +275,31 @@ struct ImprovedCreateLeagueView: View {
             }
         }
         .navigationTitle("Create League")
+        .onAppear {
+            // If we have location, load nearby courses when view appears
+            if !nearbyCoursesLoaded {
+                loadNearbyCourses()
+            }
+        }
+    }
+    
+    private func loadNearbyCourses() {
+        // If we have location, find nearby courses
+        if let _ = locationManager.currentLocation {
+            nearbyCourses = locationManager.findNearbyCourses()
+            nearbyCoursesLoaded = true
+        } else {
+            // Request location if not available and try again after getting it
+            locationManager.requestLocationIfNeeded()
+            
+            // Check for location after a short delay
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                if let _ = locationManager.currentLocation {
+                    nearbyCourses = locationManager.findNearbyCourses()
+                    nearbyCoursesLoaded = true
+                }
+            }
+        }
     }
     
     private var memberSearchSection: some View {
@@ -312,7 +445,7 @@ struct ImprovedCreateLeagueView: View {
     }
     
     private var isFormValid: Bool {
-        !leagueName.isEmpty && !selectedCourse.isEmpty
+        !leagueName.isEmpty && selectedCourse != nil
     }
     
     // Search function to fetch users based on query
@@ -389,12 +522,24 @@ struct ImprovedCreateLeagueView: View {
         // Calculate next play date based on schedule
         let nextPlayDate = calculateNextPlayDate()
         
+        // Get course information
+        guard let course = selectedCourse else {
+            isCreating = false
+            alertMessage = "Please select a golf course"
+            showAlert = true
+            return
+        }
+        
         // Prepare league data
         var leagueData: [String: Any] = [
             "name": leagueName,
             "hostUserId": currentUserId,
             "members": memberIds,
-            "course": selectedCourse,
+            "course": course.Name,
+            "courseId": course.id,
+            "courseLocation": "\(course.City), \(course.State)",
+            "courseLat": course.Latitude,
+            "courseLng": course.Longitude,
             "schedule": playFrequency.rawValue,
             "playDay": selectedDay.rawValue,
             "createdAt": Timestamp(date: Date()),
@@ -458,7 +603,7 @@ struct ImprovedCreateLeagueView: View {
     
     private func resetForm() {
         leagueName = ""
-        selectedCourse = ""
+        selectedCourse = nil
         leagueDescription = ""
         leaguePhoto = nil
         playFrequency = .weekly
@@ -466,62 +611,5 @@ struct ImprovedCreateLeagueView: View {
         teeTime = Date()
         selectedMembers = []
         addMembersLater = true
-    }
-}
-
-//// Helper structures
-//struct SectionHeader: View {
-//    let title: String
-//    
-//    var body: some View {
-//        Text(title)
-//            .font(.subheadline)
-//            .fontWeight(.semibold)
-//            .foregroundColor(.gray)
-//            .padding(.top, 10)
-//    }
-//}
-
-// Photo picker using PHPickerViewController for iOS 14+
-struct PHPickerViewRepresentable: UIViewControllerRepresentable {
-    @Binding var image: UIImage?
-    
-    func makeUIViewController(context: Context) -> PHPickerViewController {
-        var config = PHPickerConfiguration()
-        config.filter = .images
-        config.selectionLimit = 1
-        
-        let picker = PHPickerViewController(configuration: config)
-        picker.delegate = context.coordinator
-        return picker
-    }
-    
-    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
-    
-    func makeCoordinator() -> Coordinator {
-        Coordinator(self)
-    }
-    
-    class Coordinator: NSObject, PHPickerViewControllerDelegate {
-        let parent: PHPickerViewRepresentable
-        
-        init(_ parent: PHPickerViewRepresentable) {
-            self.parent = parent
-        }
-        
-        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
-            picker.dismiss(animated: true)
-            
-            guard let provider = results.first?.itemProvider else { return }
-            
-            if provider.canLoadObject(ofClass: UIImage.self) {
-                provider.loadObject(ofClass: UIImage.self) { [weak self] image, error in
-                    DispatchQueue.main.async {
-                        guard let self = self, let image = image as? UIImage else { return }
-                        self.parent.image = image
-                    }
-                }
-            }
-        }
     }
 }

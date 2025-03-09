@@ -3,26 +3,32 @@ import Firebase
 
 @main
 struct AldoApp: App {
+    // Initialize environment objects
+    @StateObject private var locationManager = AppLocationManager()
     @StateObject private var workoutManager = iOSWorkoutManager()
-    @StateObject private var authManager = AuthenticationManager()
     @StateObject private var networkMonitor = NetworkMonitor()
-    @StateObject private var notificationManager = AldoNotificationManager.shared
-
+    @StateObject private var authManager = AuthenticationManager()
+    @StateObject private var notificationManager = AldoNotificationManager()
+    
     init() {
-        // Initialize Firebase first, before any other Firebase service is used
+        // Configure Firebase
         FirebaseApp.configure()
         
-        // Configure Firestore settings after Firebase is initialized
-        FirestoreManager.configureFirestore()
+        // Any other app initialization
     }
-
+    
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(locationManager)
                 .environmentObject(workoutManager)
-                .environmentObject(authManager)
                 .environmentObject(networkMonitor)
+                .environmentObject(authManager)
                 .environmentObject(notificationManager)
+                .onAppear {
+                    // Request location permissions immediately on app launch
+                    locationManager.requestLocationIfNeeded()
+                }
         }
     }
 }

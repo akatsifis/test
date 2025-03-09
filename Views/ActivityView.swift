@@ -1,26 +1,285 @@
-//
-//  ActivityView.swift
-//  Aldo
-//
-//  Created by Andrew Katsifis on 6/12/24.
-//
-
 import SwiftUI
 import FirebaseFirestore
 import FirebaseAuth
 
+class ActivityViewModel: ObservableObject {
+    @Published var currentUser: Models.User?
+    @Published var friends: [Models.User] = []
+    @Published var leagues: [EnhancedLeague] = []
+    @Published var isLoading = true
+    @Published var errorMessage: String?
+    
+    private var db = Firestore.firestore()
+    
+    // Maintain reference to listeners so they can be detached later
+    private var userListener: ListenerRegistration?
+    private var friendListeners: [String: ListenerRegistration] = [:]
+    private var leagueListeners: [ListenerRegistration] = []
+    
+    init() {
+        setupListeners()
+    }
+    
+    deinit {
+        // Clean up all listeners when ViewModel is deallocated
+        removeAllListeners()
+    }
+    
+    func setupListeners() {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            self.isLoading = false
+            self.errorMessage = "You need to be logged in to view activity"
+            return
+        }
+        
+        self.isLoading = true
+        self.errorMessage = nil
+        
+        // Setup listener for current user
+        setupUserListener(uid: uid)
+    }
+    
+    private func setupUserListener(uid: String) {
+        // Remove any existing user listener
+        userListener?.remove()
+        
+        // Create new listener for user document
+        userListener = db.collection("users").document(uid)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                
+                if let error = error {
+                    self.isLoading = false
+                    self.errorMessage = "Error loading your data: \(error.localizedDescription)"
+                    return
+                }
+                
+                guard let snapshot = snapshot, let data = snapshot.data() else {
+                    self.isLoading = false
+                    self.errorMessage = "User profile not found"
+                    return
+                }
+                
+                // Parse user data
+                if let user = Models.User.fromDictionary(data, id: uid) {
+                    self.currentUser = user
+                    
+                    // If user has friends, setup listeners for them
+                    if !user.friends.isEmpty {
+                        self.setupFriendListeners(friendIds: user.friends)
+                    } else {
+                        // No friends, just setup league listeners
+                        self.setupLeagueListeners(uid: uid)
+                    }
+                } else {
+                    self.isLoading = false
+                    self.errorMessage = "Error parsing user data"
+                }
+            }
+    }
+    
+    private func setupFriendListeners(friendIds: [String]) {
+        // Remove any listeners for friends that are no longer in the list
+        for (friendId, listener) in friendListeners {
+            if !friendIds.contains(friendId) {
+                listener.remove()
+                friendListeners.removeValue(forKey: friendId)
+            }
+        }
+        
+        // Map of friend IDs to facilitate tracking which ones have been processed
+        var newFriends: [String: Models.User] = [:]
+        var pendingFriends = friendIds.count
+        
+        // Setup listeners for each friend
+        for friendId in friendIds {
+            // Skip if we already have a listener for this friend
+            if friendListeners[friendId] != nil {
+                pendingFriends -= 1
+                continue
+            }
+            
+            // Create a new listener for this friend
+            let listener = db.collection("users").document(friendId)
+                .addSnapshotListener { [weak self] snapshot, error in
+                    guard let self = self else { return }
+                    
+                    // Count this friend as processed
+                    pendingFriends -= 1
+                    
+                    if let error = error {
+                        print("Error fetching friend data: \(error.localizedDescription)")
+                        return
+                    }
+                    
+                    guard let snapshot = snapshot, snapshot.exists, let data = snapshot.data() else {
+                        print("Friend data not found for ID: \(friendId)")
+                        return
+                    }
+                    
+                    if let friend = Models.User.fromDictionary(data, id: friendId) {
+                        newFriends[friendId] = friend
+                    }
+                    
+                    // If all friends have been processed, update the friends list
+                    if pendingFriends <= 0 {
+                        // Build complete list of friends
+                        var allFriends: [Models.User] = []
+                        
+                        // First add existing friends that are still in the list
+                        for friend in self.friends {
+                            if friendIds.contains(friend.id) {
+                                // Use updated version if available
+                                if let updatedFriend = newFriends[friend.id] {
+                                    allFriends.append(updatedFriend)
+                                    newFriends.removeValue(forKey: friend.id)
+                                } else {
+                                    allFriends.append(friend)
+                                }
+                            }
+                        }
+                        
+                        // Then add any new friends
+                        allFriends.append(contentsOf: newFriends.values)
+                        
+                        // Update the friends list
+                        self.friends = allFriends
+                        
+                        // Setup league listeners after friends are loaded
+                        self.setupLeagueListeners(uid: Auth.auth().currentUser?.uid ?? "")
+                    }
+                }
+            
+            // Store the listener
+            friendListeners[friendId] = listener
+        }
+        
+        // If no friends to process, setup league listeners directly
+        if friendIds.isEmpty {
+            setupLeagueListeners(uid: Auth.auth().currentUser?.uid ?? "")
+        }
+    }
+    
+    private func setupLeagueListeners(uid: String) {
+        // Remove any existing league listeners
+        for listener in leagueListeners {
+            listener.remove()
+        }
+        leagueListeners = []
+        
+        // Setup listener for leagues where user is host
+        let hostLeagueListener = db.collection("leagues")
+            .whereField("hostUserId", isEqualTo: uid)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                
+                if let error = error {
+                    print("Error fetching hosted leagues: \(error.localizedDescription)")
+                    return
+                }
+                
+                var fetchedLeagues: [EnhancedLeague] = []
+                
+                if let documents = snapshot?.documents {
+                    for document in documents {
+                        if let league = EnhancedLeague.fromDictionary(document.data(), id: document.documentID) {
+                            fetchedLeagues.append(league)
+                        }
+                    }
+                }
+                
+                // Update leagues (we'll merge with member leagues later)
+                self.updateLeagues(hostLeagues: fetchedLeagues)
+            }
+        
+        leagueListeners.append(hostLeagueListener)
+        
+        // Setup listener for leagues where user is a member
+        let memberLeagueListener = db.collection("leagues")
+            .whereField("members", arrayContains: uid)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                
+                if let error = error {
+                    print("Error fetching member leagues: \(error.localizedDescription)")
+                    return
+                }
+                
+                var fetchedLeagues: [EnhancedLeague] = []
+                
+                if let documents = snapshot?.documents {
+                    for document in documents {
+                        if let league = EnhancedLeague.fromDictionary(document.data(), id: document.documentID) {
+                            fetchedLeagues.append(league)
+                        }
+                    }
+                }
+                
+                // Update leagues (we'll merge with host leagues)
+                self.updateLeagues(memberLeagues: fetchedLeagues)
+            }
+        
+        leagueListeners.append(memberLeagueListener)
+        
+        // We're done loading
+        self.isLoading = false
+    }
+    
+    // Property to store leagues where user is host
+    private var hostLeagues: [EnhancedLeague] = []
+    
+    // Property to store leagues where user is member
+    private var memberLeagues: [EnhancedLeague] = []
+    
+    // Method to update leagues based on host leagues
+    private func updateLeagues(hostLeagues: [EnhancedLeague]? = nil, memberLeagues: [EnhancedLeague]? = nil) {
+        if let hostLeagues = hostLeagues {
+            self.hostLeagues = hostLeagues
+        }
+        
+        if let memberLeagues = memberLeagues {
+            self.memberLeagues = memberLeagues
+        }
+        
+        // Combine host and member leagues, avoiding duplicates
+        var allLeagues = self.hostLeagues
+        
+        for league in self.memberLeagues {
+            if !allLeagues.contains(where: { $0.id == league.id }) {
+                allLeagues.append(league)
+            }
+        }
+        
+        // Update the published leagues property
+        self.leagues = allLeagues
+    }
+    
+    // Method to remove all listeners
+    func removeAllListeners() {
+        userListener?.remove()
+        
+        for (_, listener) in friendListeners {
+            listener.remove()
+        }
+        friendListeners.removeAll()
+        
+        for listener in leagueListeners {
+            listener.remove()
+        }
+        leagueListeners.removeAll()
+    }
+}
+
+// Updated ActivityView to use the view model
 struct ActivityView: View {
-    @State private var currentUser: Models.User?
-    @State private var friends: [Models.User] = []
-    @State private var isLoading = true
-    @State private var errorMessage: String?
+    @StateObject private var viewModel = ActivityViewModel()
     
     var body: some View {
         NavigationView {
             ZStack {
-                if isLoading {
+                if viewModel.isLoading {
                     ProgressView("Loading activity data...")
-                } else if let error = errorMessage {
+                } else if let error = viewModel.errorMessage {
                     VStack {
                         Image(systemName: "exclamationmark.triangle")
                             .font(.largeTitle)
@@ -32,8 +291,7 @@ struct ActivityView: View {
                             .padding()
                         
                         Button("Try Again") {
-                            errorMessage = nil
-                            fetchData()
+                            viewModel.setupListeners()
                         }
                         .padding()
                         .background(Color.blue)
@@ -44,7 +302,7 @@ struct ActivityView: View {
                 } else {
                     List {
                         // Current User Activity Section
-                        if let user = currentUser {
+                        if let user = viewModel.currentUser {
                             Section(header: Text("Your Activity").font(.headline)) {
                                 
                                 // User summary card
@@ -66,9 +324,9 @@ struct ActivityView: View {
                         }
                         
                         // Friends Activity Section
-                        if !friends.isEmpty {
+                        if !viewModel.friends.isEmpty {
                             Section(header: Text("Friends' Activity").font(.headline)) {
-                                ForEach(friends) { friend in
+                                ForEach(viewModel.friends) { friend in
                                     // Only show if friend has scores
                                     if !friend.scores.isEmpty {
                                         VStack(alignment: .leading) {
@@ -117,117 +375,57 @@ struct ActivityView: View {
                                 .padding(.vertical, 12)
                             }
                         }
+                        
+                        // League Activity Section
+                        if !viewModel.leagues.isEmpty {
+                            Section(header: Text("League Activity").font(.headline)) {
+                                ForEach(viewModel.leagues) { league in
+                                    NavigationLink(destination: EnhancedLeagueDetailView(
+                                        league: league,
+                                        isHost: league.hostUserId == Auth.auth().currentUser?.uid
+                                    )) {
+                                        LeagueActivityCard(league: league)
+                                    }
+                                    .buttonStyle(PlainButtonStyle())
+                                }
+                            }
+                        } else {
+                            Section(header: Text("League Activity").font(.headline)) {
+                                VStack(spacing: 12) {
+                                    Text("You're not part of any leagues yet")
+                                        .foregroundColor(.gray)
+                                        .italic()
+                                    
+                                    NavigationLink(destination: LeagueDashboardView()) {
+                                        Text("Join a League")
+                                            .foregroundColor(.white)
+                                            .padding(.horizontal, 20)
+                                            .padding(.vertical, 8)
+                                            .background(Color.green)
+                                            .cornerRadius(8)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                            }
+                        }
                     }
                     .listStyle(InsetGroupedListStyle())
                     .refreshable {
-                        await refreshData()
+                        // Reinitialize listeners on manual refresh
+                        viewModel.removeAllListeners()
+                        viewModel.setupListeners()
                     }
                 }
             }
             .navigationTitle("Activity Feed")
-            .onAppear(perform: fetchData)
-        }
-    }
-    
-    private func fetchData() {
-        isLoading = true
-        errorMessage = nil
-        
-        guard let uid = Auth.auth().currentUser?.uid else {
-            isLoading = false
-            errorMessage = "You need to be logged in to view activity"
-            return
-        }
-        
-        let db = Firestore.firestore()
-        
-        // Fetch current user
-        db.collection("users").document(uid).getDocument { snapshot, error in
-            if let error = error {
-                DispatchQueue.main.async {
-                    isLoading = false
-                    errorMessage = "Error loading your data: \(error.localizedDescription)"
-                }
-                return
+            .onAppear {
+                // Setup listeners when view appears
+                viewModel.setupListeners()
             }
-            
-            guard let snapshot = snapshot, let data = snapshot.data() else {
-                DispatchQueue.main.async {
-                    isLoading = false
-                    errorMessage = "User profile not found"
-                }
-                return
-            }
-            
-            // Parse user data
-            if let user = Models.User.fromDictionary(data, id: uid) {
-                DispatchQueue.main.async {
-                    self.currentUser = user
-                }
-                
-                // If user has friends, fetch them
-                if !user.friends.isEmpty {
-                    fetchFriends(friendIds: user.friends)
-                } else {
-                    DispatchQueue.main.async {
-                        self.isLoading = false
-                    }
-                }
-            } else {
-                DispatchQueue.main.async {
-                    isLoading = false
-                    errorMessage = "Error parsing user data"
-                }
-            }
-        }
-    }
-    
-    private func fetchFriends(friendIds: [String]) {
-        let db = Firestore.firestore()
-        let dispatchGroup = DispatchGroup()
-        var fetchedFriends: [Models.User] = []
-        var fetchErrors: [String] = []
-        
-        for friendId in friendIds {
-            dispatchGroup.enter()
-            
-            db.collection("users").document(friendId).getDocument { snapshot, error in
-                defer { dispatchGroup.leave() }
-                
-                if let error = error {
-                    fetchErrors.append("Error fetching friend data: \(error.localizedDescription)")
-                    return
-                }
-                
-                guard let snapshot = snapshot, snapshot.exists, let data = snapshot.data() else {
-                    fetchErrors.append("Friend data not found for ID: \(friendId)")
-                    return
-                }
-                
-                if let friend = Models.User.fromDictionary(data, id: friendId) {
-                    fetchedFriends.append(friend)
-                }
-            }
-        }
-        
-        dispatchGroup.notify(queue: .main) {
-            self.friends = fetchedFriends
-            self.isLoading = false
-            
-            // If we had errors but still got some friends, we don't show the error
-            if fetchedFriends.isEmpty && !fetchErrors.isEmpty {
-                self.errorMessage = fetchErrors.first
-            }
-        }
-    }
-    
-    private func refreshData() async {
-        // Create a task that fetches the data and can be awaited
-        return await withCheckedContinuation { continuation in
-            fetchData()
-            // Always continue after a delay to ensure UI updates properly
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                continuation.resume()
+            .onDisappear {
+                // Clean up listeners when view disappears
+                viewModel.removeAllListeners()
             }
         }
     }
@@ -291,6 +489,70 @@ struct UserSummaryCard: View {
             
             Spacer()
         }
+    }
+}
+
+struct LeagueActivityCard: View {
+    let league: EnhancedLeague
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(league.name)
+                        .font(.headline)
+                    
+                    Text(league.course)
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+                }
+                
+                Spacer()
+                
+                Text("\(league.schedule) on \(league.playDay.rawValue)")
+                    .font(.caption)
+                    .foregroundColor(.blue)
+                    .multilineTextAlignment(.trailing)
+            }
+            
+            Divider()
+            
+            HStack {
+                if let nextDate = league.nextScheduledDate {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Next Play:")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                        
+                        Text(formatDate(nextDate.dateValue()))
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    }
+                }
+                
+                Spacer()
+                
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("Members:")
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                    
+                    Text("\(league.members.count + 1)") // +1 for host
+                        .font(.caption)
+                        .foregroundColor(.primary)
+                }
+            }
+        }
+        .padding()
+        .background(Color(.systemGray6))
+        .cornerRadius(10)
+    }
+    
+    private func formatDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 }
 
@@ -362,11 +624,5 @@ struct ScoreCard: View {
         formatter.dateStyle = .medium
         formatter.timeStyle = .none
         return formatter.string(from: date)
-    }
-}
-
-struct ActivityView_Previews: PreviewProvider {
-    static var previews: some View {
-        ActivityView()
     }
 }

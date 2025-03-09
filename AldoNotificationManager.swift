@@ -1,183 +1,202 @@
-//
-//  AldoNotificationManager.swift
-//  Aldo
-//
-//  Created by Andrew Katsifis on 3/8/25.
-//
-
-
-// AldoNotificationManager.swift
 import Foundation
-import Firebase
-import FirebaseFirestore
+import UserNotifications
 import SwiftUI
-import Combine
+
+enum NotificationType: String, Codable {
+    case friendRequest
+    case leagueInvite
+    case gameReminder
+    case scoreUpdate
+    case general
+}
+
+struct AldoNotification: Identifiable, Codable {
+    var id: String = UUID().uuidString
+    var title: String
+    var body: String
+    var date: Date
+    var type: NotificationType
+    var read: Bool = false
+}
 
 class AldoNotificationManager: ObservableObject {
     static let shared = AldoNotificationManager()
     
-    @Published var notifications: [AldoNotification] = []
-    @Published var unreadCount: Int = 0
+    // System notification properties
+    @Published var hasPermission = false
+    @Published var pendingNotifications: [UNNotificationRequest] = []
     
-    private var db = Firestore.firestore()
-    private var listenerRegistration: ListenerRegistration?
+    // In-app notification properties
+    @Published var notifications: [AldoNotification] = []
     
     init() {
-        // Start listening for auth state changes
-        Auth.auth().addStateDidChangeListener { [weak self] (_, user) in
-            if let userId = user?.uid {
-                self?.startListeningForNotifications(userId: userId)
-            } else {
-                self?.stopListeningForNotifications()
-                self?.notifications = []
-                self?.unreadCount = 0
+        checkPermission()
+        loadPendingNotifications()
+        loadSavedNotifications()
+    }
+    
+    // MARK: - System Notification Methods
+    
+    func checkPermission() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            DispatchQueue.main.async {
+                self.hasPermission = settings.authorizationStatus == .authorized
             }
         }
     }
     
-    deinit {
-        stopListeningForNotifications()
-    }
-    
-    // Start listening for notifications for a specific user
-    func startListeningForNotifications(userId: String) {
-        // Stop any existing listener first
-        stopListeningForNotifications()
-        
-        // Create a new listener
-        listenerRegistration = db.collection("users").document(userId)
-            .collection("notifications")
-            .order(by: "timestamp", descending: true)
-            .limit(to: 50)
-            .addSnapshotListener { [weak self] (snapshot, error) in
-                guard let self = self else { return }
-                
+    func requestPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { success, error in
+            DispatchQueue.main.async {
+                self.hasPermission = success
                 if let error = error {
-                    print("Error listening for notifications: \(error.localizedDescription)")
-                    return
+                    print("Notification permission error: \(error.localizedDescription)")
                 }
-                
-                guard let documents = snapshot?.documents else { return }
-                
-                self.notifications = documents.compactMap { document in
-                    AldoNotification.fromDictionary(document.data(), id: document.documentID)
-                }
-                
-                // Update unread count
-                self.unreadCount = self.notifications.filter { !$0.isRead }.count
             }
+        }
     }
     
-    func stopListeningForNotifications() {
-        listenerRegistration?.remove()
-        listenerRegistration = nil
+    func scheduleNotification(title: String, body: String, date: Date) {
+        // Create notification content
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        
+        // Create trigger
+        let dateComponents = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+        let trigger = UNCalendarNotificationTrigger(dateMatching: dateComponents, repeats: false)
+        
+        // Create request
+        let identifier = UUID().uuidString
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
+        
+        // Add request to notification center
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                print("Error scheduling notification: \(error.localizedDescription)")
+            } else {
+                DispatchQueue.main.async {
+                    self.loadPendingNotifications()
+                }
+            }
+        }
     }
     
-    // Create a notification
-    func createNotification(for userId: String, title: String, message: String, type: AldoNotification.NotificationType, relatedId: String? = nil, completion: ((Error?) -> Void)? = nil) {
+    func loadPendingNotifications() {
+        UNUserNotificationCenter.current().getPendingNotificationRequests { requests in
+            DispatchQueue.main.async {
+                self.pendingNotifications = requests
+            }
+        }
+    }
+    
+    func cancelNotification(withIdentifier identifier: String) {
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [identifier])
+        loadPendingNotifications()
+    }
+    
+    func cancelAllNotifications() {
+        UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+        loadPendingNotifications()
+    }
+    
+    // MARK: - In-App Notification Methods
+    
+    func addNotification(title: String, body: String, type: NotificationType) {
         let notification = AldoNotification(
-            userId: userId,
             title: title,
-            message: message,
-            type: type,
-            relatedId: relatedId,
-            timestamp: Date(),
-            isRead: false
+            body: body,
+            date: Date(),
+            type: type
         )
         
-        db.collection("users").document(userId)
-            .collection("notifications").document(notification.id)
-            .setData(notification.toDictionary()) { error in
-                if let error = error {
-                    print("Error creating notification: \(error.localizedDescription)")
-                }
-                completion?(error)
-            }
+        DispatchQueue.main.async {
+            self.notifications.append(notification)
+            self.saveNotifications()
+        }
     }
     
-    // Mark a notification as read
-    func markAsRead(notificationId: String, completion: ((Error?) -> Void)? = nil) {
-        guard let userId = Auth.auth().currentUser?.uid else {
-            completion?(NSError(domain: "NotificationManager", code: 1001, userInfo: [NSLocalizedDescriptionKey: "User not authenticated"]))
-            return
-        }
+    func markAsRead(at index: Int) {
+        guard index >= 0 && index < notifications.count else { return }
         
-        db.collection("users").document(userId)
-            .collection("notifications").document(notificationId)
-            .updateData(["isRead": true]) { error in
-                if let error = error {
-                    print("Error marking notification as read: \(error.localizedDescription)")
-                }
-                
-                // Update local state
-                if let index = self.notifications.firstIndex(where: { $0.id == notificationId }) {
-                    DispatchQueue.main.async {
-                        self.notifications[index].isRead = true
-                        self.unreadCount = self.notifications.filter { !$0.isRead }.count
-                    }
-                }
-                
-                completion?(error)
-            }
+        DispatchQueue.main.async {
+            self.notifications[index].read = true
+            self.saveNotifications()
+        }
     }
     
-    // Mark all notifications as read
-    func markAllAsRead(completion: ((Error?) -> Void)? = nil) {
-        guard let userId = Auth.auth().currentUser?.uid else {
-            completion?(NSError(domain: "NotificationManager", code: 1001, userInfo: [NSLocalizedDescriptionKey: "User not authenticated"]))
-            return
+    func markAllAsRead() {
+        DispatchQueue.main.async {
+            for i in 0..<self.notifications.count {
+                self.notifications[i].read = true
+            }
+            self.saveNotifications()
         }
+    }
+    
+    func deleteNotification(at index: Int) {
+        guard index >= 0 && index < notifications.count else { return }
         
-        // Get all unread notifications
-        let unreadIds = notifications.filter { !$0.isRead }.map { $0.id }
-        if unreadIds.isEmpty {
-            completion?(nil)
-            return
+        DispatchQueue.main.async {
+            self.notifications.remove(at: index)
+            self.saveNotifications()
         }
-        
-        let batch = db.batch()
-        
-        // Update each notification
-        for notificationId in unreadIds {
-            let notificationRef = db.collection("users").document(userId)
-                .collection("notifications").document(notificationId)
-            batch.updateData(["isRead": true], forDocument: notificationRef)
+    }
+    
+    // MARK: - Storage Methods
+    
+    private func saveNotifications() {
+        if let encoded = try? JSONEncoder().encode(notifications) {
+            UserDefaults.standard.set(encoded, forKey: "savedNotifications")
         }
+    }
+    
+    private func loadSavedNotifications() {
+        if let savedNotifications = UserDefaults.standard.data(forKey: "savedNotifications") {
+            if let decodedNotifications = try? JSONDecoder().decode([AldoNotification].self, from: savedNotifications) {
+                notifications = decodedNotifications
+            }
+        }
+    }
+    
+    // MARK: - Combined Methods (both system and in-app)
+    
+    func scheduleAndAddNotification(title: String, body: String, date: Date, type: NotificationType) {
+        // Schedule system notification
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
         
-        // Commit the batch
-        batch.commit { error in
+        let dateComponents = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+        let trigger = UNCalendarNotificationTrigger(dateMatching: dateComponents, repeats: false)
+        
+        let identifier = UUID().uuidString
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
+        
+        UNUserNotificationCenter.current().add(request) { error in
             if let error = error {
-                print("Error marking all notifications as read: \(error.localizedDescription)")
+                print("Error scheduling notification: \(error.localizedDescription)")
             } else {
-                // Update local state
                 DispatchQueue.main.async {
-                    for i in 0..<self.notifications.count {
-                        self.notifications[i].isRead = true
-                    }
-                    self.unreadCount = 0
+                    self.loadPendingNotifications()
                 }
             }
-            
-            completion?(error)
-        }
-    }
-    
-    // Delete a notification
-    func deleteNotification(notificationId: String, completion: ((Error?) -> Void)? = nil) {
-        guard let userId = Auth.auth().currentUser?.uid else {
-            completion?(NSError(domain: "NotificationManager", code: 1001, userInfo: [NSLocalizedDescriptionKey: "User not authenticated"]))
-            return
         }
         
-        db.collection("users").document(userId)
-            .collection("notifications").document(notificationId)
-            .delete { error in
-                if let error = error {
-                    print("Error deleting notification: \(error.localizedDescription)")
-                }
-                
-                // Update local state (will happen automatically via listener)
-                completion?(error)
-            }
+        // Add in-app notification
+        let notification = AldoNotification(
+            id: identifier,
+            title: title,
+            body: body,
+            date: date,
+            type: type
+        )
+        
+        DispatchQueue.main.async {
+            self.notifications.append(notification)
+            self.saveNotifications()
+        }
     }
 }

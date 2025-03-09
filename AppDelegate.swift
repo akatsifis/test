@@ -14,6 +14,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // Request HealthKit authorization
         requestHealthAuthorization()
         
+        // Run the direct CSV converter
+        print("Starting CSV conversion...")
+        DirectCSVConverter.convert()
+        print("CSV conversion call completed")
+        
         return true
     }
 
